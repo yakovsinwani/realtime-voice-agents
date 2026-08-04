@@ -1,0 +1,17 @@
+{
+  "name": "twilio-realtime-agents-example-express",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch server.ts"
+  },
+  "dependencies": {
+    "express": "^5.0.0",
+    "express-ws": "^5.0.2",
+    "twilio-realtime-agents": "file:../..",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0"
+  }
+}

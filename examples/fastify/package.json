@@ -1,0 +1,21 @@
+{
+  "name": "twilio-realtime-agents-example-fastify",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch server.ts",
+    "start": "tsx server.ts",
+    "call": "tsx outbound-call.ts"
+  },
+  "dependencies": {
+    "@fastify/formbody": "^8.0.0",
+    "@fastify/websocket": "^11.0.0",
+    "fastify": "^5.0.0",
+    "twilio": "^6.0.0",
+    "twilio-realtime-agents": "file:../..",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0"
+  }
+}

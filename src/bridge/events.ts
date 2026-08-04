@@ -2,6 +2,7 @@ import type { Agent } from '../agents/Agent.js';
 import type { ProviderUsage } from '../providers/base/events.js';
 import type { TranscriptEntry } from '../session/transcript.js';
 import type { UsageInfo } from '../session/usage.js';
+import type { CallSession } from './CallSession.js';
 import type { CallEndReason } from './state.js';
 
 export interface CallStartedInfo {
@@ -77,7 +78,7 @@ export interface SessionEventMap extends Record<string, (...args: any[]) => void
 }
 
 export interface BridgeEventMap extends Record<string, (...args: any[]) => void> {
-  'session.started': (session: unknown) => void;
+  'session.started': (session: CallSession) => void;
   'session.ended': (info: { callSid: string; reason: CallEndReason }) => void;
   'connection.rejected': (info: { reason: string }) => void;
   error: (error: Error) => void;
