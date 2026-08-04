@@ -29,3 +29,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # setup-node's registry-url writes an .npmrc that authenticates via
+          # NODE_AUTH_TOKEN — without this line, npm publishes unauthenticated
+          # and the registry answers with a misleading E404.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
