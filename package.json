@@ -1,6 +1,6 @@
 {
   "name": "twilio-realtime-agents",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "Provider-agnostic bridge between Twilio Media Streams and realtime speech-to-speech AI APIs (OpenAI Realtime, xAI Grok Voice, Gemini Live). Multi-agent handoffs, Zod tools with execution strategies, mark-based playback tracking, interruption guards, and hold audio — for Node.js voice agents over the phone.",
   "keywords": [
     "twilio",
