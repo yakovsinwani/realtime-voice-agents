@@ -34,6 +34,11 @@ export interface ProviderSessionInit {
   transcription?: { model?: string; language?: string } | false;
   /** Session-resumption handle from a previous connection (capability-gated). */
   resumptionHandle?: string;
+  /**
+   * Force a brand-new server session: ignore any stored resumption handle.
+   * Used for handoffs, where the session config itself changes.
+   */
+  freshSession?: boolean;
   /** Provider-native session options, deep-merged last (escape hatch). */
   providerOptions?: Record<string, unknown>;
 }

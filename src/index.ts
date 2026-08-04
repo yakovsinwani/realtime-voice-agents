@@ -34,6 +34,19 @@ export type {
 
 // Agents
 export { Agent, collectAgentGraph, type AgentDefinition } from './agents/Agent.js';
+export {
+  createHandoffTool,
+  handoffToolName,
+  isHandoffDirective,
+  type HandoffDirective,
+} from './agents/handoff.js';
+
+// Pre-synthesized greeting capture
+export {
+  captureGreetingAudio,
+  type CaptureGreetingOptions,
+  type CapturedGreeting,
+} from './greeting/capture.js';
 
 // Tools
 export {

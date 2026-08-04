@@ -127,7 +127,10 @@ export class GeminiLiveProvider extends BaseRealtimeProvider {
     this.outbound.reset();
 
     const connector = this.config.connector ?? (await this.defaultConnector());
-    const handle = init.resumptionHandle ?? this.resumptionHandle ?? undefined;
+    const handle = init.freshSession
+      ? undefined
+      : (init.resumptionHandle ?? this.resumptionHandle ?? undefined);
+    if (init.freshSession) this.resumptionHandle = null;
 
     let setupResolve!: () => void;
     let setupReject!: (error: Error) => void;

@@ -8,10 +8,12 @@
  * socket is released exactly once.
  */
 
-import { base64ByteLength } from '../audio/mulaw.js';
+import { base64ByteLength, mulawBytesToMs } from '../audio/mulaw.js';
 import { BackgroundAudioPlayer } from '../audio/background/BackgroundAudioPlayer.js';
 import type { BackgroundAudioOptions, BackgroundAudioSpec } from '../audio/background/presets.js';
 import type { Agent } from '../agents/Agent.js';
+import { collectAgentGraph } from '../agents/Agent.js';
+import { createHandoffTool, isHandoffDirective } from '../agents/handoff.js';
 import { InterruptionController } from '../interruption/InterruptionController.js';
 import { TypedEmitter } from '../internal/events.js';
 import { childLogger, type Logger } from '../logging/logger.js';
@@ -25,6 +27,7 @@ import { delayForAttempt } from '../providers/base/reconnect.js';
 import type { ProviderToolCall } from '../providers/base/events.js';
 import type { CallSnapshot } from '../session/snapshot.js';
 import type { SessionStore } from '../session/SessionStore.js';
+import { readFileSync } from 'node:fs';
 import { formatTranscriptForInjection, type TranscriptEntry } from '../session/transcript.js';
 import { UsageAccumulator, type UsageInfo } from '../session/usage.js';
 import { SessionContext, type CallSessionFacade, type ToolCallInfo, type ToolContext } from '../tools/context.js';
@@ -72,7 +75,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
   private readonly usageAccumulator = new UsageAccumulator();
   private readonly toolQueue = new ToolResultQueue();
   private readonly transcriptEntries: TranscriptEntry[] = [];
-  private readonly toolset: Map<string, Tool>;
+  private toolset: Map<string, Tool>;
   private readonly startedAtMs = Date.now();
   private readonly interruptedResponses = new Set<string>();
   private readonly runningTools = new Map<string, AbortController>();
@@ -112,6 +115,13 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
   private idleTimer: NodeJS.Timeout | null = null;
   private nudgeCount = 0;
 
+  /** All agents reachable from the root via handoffs, by id. */
+  private readonly agents: Map<string, Agent>;
+  private readonly handoffHistory: Array<{ from: string; to: string; atMs: number }> = [];
+  private handoffInProgress = false;
+  /** Pre-synthesized greeting playout state. */
+  private pregreeting: { text: string; durationMs: number; played: boolean } | null = null;
+
   constructor(deps: CallSessionDeps) {
     super();
     this.deps = deps;
@@ -130,6 +140,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       customParameters: params,
     };
     this.answered = deps.answeredEarly === true || this.callInfo.direction === 'inbound';
+    this.agents = collectAgentGraph(deps.agent);
     this.middlewares = deps.middlewares ?? [];
     this.bgAudio = new BackgroundAudioPlayer({
       sendMedia: (payload) => {
@@ -164,6 +175,9 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
   /** Connect the provider and activate the call. Called by the bridge. */
   async begin(): Promise<void> {
+    // Burst-write the pre-synthesized greeting BEFORE the provider handshake:
+    // the caller hears a voice within ~250ms while the model session builds.
+    this.playPreGreeting();
     try {
       this.provider = this.deps.providerFactory({ logger: this.log, callSid: this.callSid });
       this.wireProvider(this.provider);
@@ -183,6 +197,12 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       to: this.callInfo.to,
       customParameters: this.callInfo.customParameters,
     });
+    // Seed the pre-played greeting into the model's context so it continues
+    // from it instead of greeting twice (second of three no-re-greet layers;
+    // the instruction reinforcement lives in buildProviderInit).
+    if (this.pregreeting) {
+      this.provider!.sendText(this.pregreeting.text, { role: 'assistant', triggerResponse: false });
+    }
     this.flushInboundBuffer();
     this.startMaxDurationWatchdog();
     this.armIdleTimer();
@@ -254,8 +274,16 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     await this.executePendingTransfer();
   }
 
-  async handoffTo(_agent: Agent | string): Promise<void> {
-    throw new Error('multi-agent handoff is not wired yet for this session');
+  /** Swap the active agent (swarm handoff). Accepts an Agent or its id. */
+  async handoffTo(agent: Agent | string): Promise<void> {
+    const targetId = typeof agent === 'string' ? agent : agent.id;
+    const target = this.agents.get(targetId);
+    if (!target) {
+      throw new Error(
+        `unknown agent "${targetId}" — agents must be reachable from the root agent's handoffs`,
+      );
+    }
+    await this.performHandoff(target);
   }
 
   /** Complete a `deferred` tool call from the host side. */
@@ -301,6 +329,10 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
         announcement: opts.announcement,
       }));
     }
+    for (const target of this.activeAgentValue.handoffs) {
+      const handoffTool = createHandoffTool(target);
+      tools.set(handoffTool.name, handoffTool);
+    }
     for (const tool of this.activeAgentValue.tools) {
       if (tools.has(tool.name)) {
         this.log.warn(`agent tool "${tool.name}" overrides a builtin of the same name`);
@@ -312,7 +344,11 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
   private buildProviderInit(): ProviderSessionInit {
     return {
-      instructions: this.activeAgentValue.resolveInstructions(this.context),
+      instructions:
+        this.activeAgentValue.resolveInstructions(this.context) +
+        (this.pregreeting
+          ? `\n\nYou already opened the call by saying: "${this.pregreeting.text}". Do not greet again — continue the conversation from there.`
+          : ''),
       voice: this.activeAgentValue.voice,
       vad: this.deps.options.vad,
       tools: [...this.toolset.values()].map((tool) => {
@@ -420,6 +456,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
     provider.on('close', (info) => {
       if (this.stateValue === 'ended' || this.stateValue === 'ending') return;
+      if (this.handoffInProgress) return; // deliberate close-and-reopen
       this.emit('provider.closed', { code: info.code, reason: info.reason });
       if (!info.retriable) {
         this.fail(new Error(`provider closed (${info.code} ${info.reason ?? ''})`), 'provider-failed');
@@ -433,6 +470,10 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
   private handleInboundMedia(payload: string): void {
     if (this.stateValue === 'ended' || this.stateValue === 'ending') return;
+    // While the pre-synthesized greeting is playing, the provider must not
+    // hear the line: server-side VAD would treat greeting bleed/noise as a
+    // barge-in on a turn it never generated.
+    if (this.pregreeting && !this.pregreeting.played) return;
     if (this.deps.options.deafness.ignoreUserAudioUntilFirstTurnDone && !this.firstTurnDone) return;
     if (this.deps.options.deafness.muteDuringToolExecution && this.runningTools.size > 0) return;
     if (this.interruptions.isSuspended) return;
@@ -454,6 +495,17 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
   // ---- playback / marks ----------------------------------------------------
 
   private handleMarkEcho(name: string): void {
+    if (name === PREGREETING_MARK) {
+      if (this.pregreeting && !this.pregreeting.played) {
+        this.pregreeting.played = true;
+        this.emit('playback.finished', {
+          responseId: 'pregreeting',
+          playedMs: this.pregreeting.durationMs,
+        });
+        this.armIdleTimer();
+      }
+      return;
+    }
     if (!PlaybackTracker.isTrackedMark(name)) return;
     const result = this.tracker.onMarkEcho(name);
     if (!result || result.kind === 'flushed') return;
@@ -639,6 +691,29 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     this.acquireHoldAudio(call.id, tool);
     try {
       const outcome = await this.executeToolBody(tool, call, input);
+      if (outcome.ok && isHandoffDirective(outcome.result)) {
+        const directive = outcome.result;
+        const target = this.agents.get(directive.targetAgentId);
+        if (!target) {
+          this.deliverToolResult(call.id, { error: `unknown agent "${directive.targetAgentId}"` });
+          return;
+        }
+        // Settle the function call first (no response yet), then swap agents —
+        // performHandoff triggers the continuation response itself.
+        this.deliverToolResult(call.id, {
+          status: 'transferring_conversation',
+          to: target.name,
+        }, false);
+        this.emit('tool.completed', {
+          ...baseInfo,
+          strategy: tool.strategy,
+          input,
+          result: { handoffTo: target.id },
+          durationMs: Date.now() - started,
+        });
+        await this.performHandoff(target, directive.reason);
+        return;
+      }
       if (outcome.ok) {
         this.deliverToolResult(call.id, outcome.result ?? { ok: true });
         this.emit('tool.completed', {
@@ -901,6 +976,11 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
   private maybeGreet(): void {
     if (this.greeted) return;
+    if (this.pregreeting) {
+      // Third no-re-greet layer: the greeting already played from disk.
+      this.greeted = true;
+      return;
+    }
     if (this.deps.options.greeting.mode !== 'agent-initiates') return;
     if (!this.provider?.isConnected) return;
     if (this.callInfo.direction === 'outbound' && !this.answered) return;
@@ -1035,6 +1115,114 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     );
   }
 
+  // ---- handoff -------------------------------------------------------------
+
+  private async performHandoff(target: Agent, reason?: string): Promise<void> {
+    if (this.stateValue !== 'active' || !this.provider) return;
+    if (target.id === this.activeAgentValue.id) return;
+    const from = this.activeAgentValue;
+    this.activeAgentValue = target;
+    this.toolset = this.buildToolset();
+    this.handoffHistory.push({ from: from.id, to: target.id, atMs: Date.now() - this.startedAtMs });
+
+    const continueInstruction =
+      `You are now ${target.name}. Continue the SAME phone conversation naturally — ` +
+      `acknowledge the caller and take over; do not restart with a cold greeting.` +
+      (reason ? ` Transfer context: ${reason}.` : '');
+
+    const voiceChanges = target.voice !== undefined && target.voice !== from.voice;
+    const mustReconnect =
+      !this.provider.capabilities.sessionUpdate ||
+      (voiceChanges &&
+        !this.provider.capabilities.voiceChangeMidSession &&
+        this.deps.options.handoffVoicePolicy === 'reconnect');
+
+    if (!mustReconnect) {
+      if (voiceChanges && !this.provider.capabilities.voiceChangeMidSession) {
+        this.log.warn(
+          `agent "${target.id}" declares voice "${target.voice}" but the provider cannot change voice mid-session — keeping the current voice (set handoffVoicePolicy: 'reconnect' to switch)`,
+        );
+      }
+      await this.provider.updateSession({
+        instructions: this.activeAgentValue.resolveInstructions(this.context),
+        tools: this.buildProviderInit().tools,
+        providerOptions: target.providerOptions,
+      });
+      this.provider.createResponse({ instructions: continueInstruction });
+    } else {
+      // Close-and-reopen with the new agent's config, carrying context over.
+      this.handoffInProgress = true;
+      this.reconnecting = true; // buffer caller audio during the gap
+      const hold = this.deps.options.handoffHold;
+      if (hold) {
+        this.bgAudio.acquire('__handoff__', hold.spec, { ...hold, startDelayMs: hold.startDelayMs ?? 300 });
+      }
+      try {
+        await this.provider.close();
+        await this.provider.connect({ ...this.buildProviderInit(), freshSession: true });
+        this.reinjectHistory(this.provider);
+        this.provider.createResponse({ instructions: continueInstruction });
+      } catch (error) {
+        this.handoffInProgress = false;
+        this.reconnecting = false;
+        this.fail(
+          error instanceof Error ? error : new Error(String(error)),
+          'provider-failed',
+        );
+        return;
+      } finally {
+        this.bgAudio.release('__handoff__', { immediate: false });
+      }
+      this.handoffInProgress = false;
+      this.reconnecting = false;
+      this.flushInboundBuffer();
+    }
+
+    this.emit('agent.handoff', { from, to: target, reason });
+    void this.saveSnapshot();
+  }
+
+  // ---- pre-synthesized greeting --------------------------------------------
+
+  /**
+   * Burst-write a stored μ-law greeting straight onto the Twilio socket —
+   * no pacing loop (Twilio buffers and plays at line rate), so playback
+   * starts immediately while the provider session is still being built.
+   */
+  private playPreGreeting(): void {
+    const preSynthesized = this.deps.options.greeting.preSynthesized;
+    if (!preSynthesized || !this.deps.transport.isOpen) return;
+    let audio: Buffer;
+    try {
+      audio = Buffer.isBuffer(preSynthesized.audio)
+        ? preSynthesized.audio
+        : readFileSync(preSynthesized.audio);
+    } catch (error) {
+      this.log.warn('pre-synthesized greeting unavailable — falling back to model greeting', {
+        error: String(error),
+      });
+      return;
+    }
+    if (audio.length === 0) return;
+    const durationMs = mulawBytesToMs(audio.length);
+    this.pregreeting = { text: preSynthesized.text, durationMs, played: false };
+
+    for (let offset = 0; offset < audio.length; offset += PREGREETING_CHUNK_BYTES) {
+      const chunk = audio.subarray(offset, Math.min(offset + PREGREETING_CHUNK_BYTES, audio.length));
+      this.deps.transport.sendMedia(chunk.toString('base64'));
+    }
+    this.deps.transport.sendMark(PREGREETING_MARK);
+
+    const entry: TranscriptEntry = {
+      role: 'agent',
+      text: preSynthesized.text,
+      timestampMs: 0,
+      agentId: this.activeAgentValue.id,
+    };
+    this.transcriptEntries.push(entry);
+    this.emit('transcript.agent', entry);
+  }
+
   // ---- idle nudges ---------------------------------------------------------
 
   /** Armed whenever the agent goes quiet and we're waiting on the caller. */
@@ -1156,7 +1344,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       transcript: [...this.transcriptEntries],
       usage: this.usage,
       context: this.context.toJSON(),
-      handoffHistory: [],
+      handoffHistory: [...this.handoffHistory],
       startedAtMs: this.startedAtMs,
       ...(this.stateValue === 'ended'
         ? { endedAtMs: Date.now(), endReason: this.endedReason ?? undefined }
@@ -1169,6 +1357,10 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     }
   }
 }
+
+const PREGREETING_MARK = 'pre:greeting';
+/** 400ms per frame — matches production burst-write implementations. */
+const PREGREETING_CHUNK_BYTES = 3200;
 
 type ToolOutcome = { ok: true; result: unknown } | { ok: false; payload: unknown; message: string };
 

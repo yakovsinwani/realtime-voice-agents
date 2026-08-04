@@ -73,6 +73,15 @@ export interface SessionOptions {
   toolResultDelivery: 'afterPlayback' | 'immediate';
   /** Default hold audio for tools that don't specify their own. */
   toolBackgroundAudio?: { spec: BackgroundAudioSpec } & BackgroundAudioOptions;
+  /**
+   * When a handoff target declares a different voice on a provider that
+   * cannot change voice mid-session: `keep` (default) keeps the current
+   * voice; `reconnect` opens a fresh provider session with the new voice and
+   * carries context over (adds a beat of latency).
+   */
+  handoffVoicePolicy?: 'keep' | 'reconnect';
+  /** Hold audio covering the reconnect gap on handoffs that need one. */
+  handoffHold?: { spec: BackgroundAudioSpec } & BackgroundAudioOptions;
   /** Initial session context KV, available to tools and instructions. */
   context?: Record<string, unknown>;
   /** Handshake bounds for the Twilio start frame. */
