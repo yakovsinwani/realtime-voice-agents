@@ -9,6 +9,8 @@
  */
 
 import { base64ByteLength } from '../audio/mulaw.js';
+import { BackgroundAudioPlayer } from '../audio/background/BackgroundAudioPlayer.js';
+import type { BackgroundAudioOptions, BackgroundAudioSpec } from '../audio/background/presets.js';
 import type { Agent } from '../agents/Agent.js';
 import { InterruptionController } from '../interruption/InterruptionController.js';
 import { TypedEmitter } from '../internal/events.js';
@@ -26,6 +28,7 @@ import type { SessionStore } from '../session/SessionStore.js';
 import { formatTranscriptForInjection, type TranscriptEntry } from '../session/transcript.js';
 import { UsageAccumulator, type UsageInfo } from '../session/usage.js';
 import { SessionContext, type CallSessionFacade, type ToolCallInfo, type ToolContext } from '../tools/context.js';
+import { composeExecution, decorateTool, type ToolMiddleware } from '../tools/middleware.js';
 import { ToolResultQueue } from '../tools/result-queue.js';
 import type { Tool } from '../tools/tool.js';
 import { createFinishCallTool } from '../tools/builtins/finishCall.js';
@@ -51,6 +54,7 @@ export interface CallSessionDeps {
   rest?: TwilioRestClient;
   restCallerId?: string;
   answeredEarly?: boolean;
+  middlewares?: readonly ToolMiddleware[];
   onEnded?: (callSid: string, reason: CallEndReason) => void;
 }
 
@@ -92,6 +96,21 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
   } | null = null;
   private pendingTransfer: { phoneNumber: string; callerId?: string } | null = null;
   private endedReason: CallEndReason | null = null;
+  private hangupReason: CallEndReason = 'agent-hangup';
+
+  private readonly middlewares: readonly ToolMiddleware[];
+  private readonly bgAudio: BackgroundAudioPlayer;
+  /** Deferred tool calls awaiting a real result (execute() or submitToolResult). */
+  private readonly deferredPending = new Map<string, { toolName: string }>();
+  /** Human-in-the-loop calls awaiting approve/reject. */
+  private readonly approvals = new Map<
+    string,
+    { call: ProviderToolCall; tool: Tool; input: unknown; timer: NodeJS.Timeout }
+  >();
+  /** Text turns to inject once the agent finishes speaking (deferred results). */
+  private pendingInjections: Array<{ text: string; triggerResponse: boolean }> = [];
+  private idleTimer: NodeJS.Timeout | null = null;
+  private nudgeCount = 0;
 
   constructor(deps: CallSessionDeps) {
     super();
@@ -111,6 +130,16 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       customParameters: params,
     };
     this.answered = deps.answeredEarly === true || this.callInfo.direction === 'inbound';
+    this.middlewares = deps.middlewares ?? [];
+    this.bgAudio = new BackgroundAudioPlayer({
+      sendMedia: (payload) => {
+        if (this.stateValue === 'active' && this.deps.transport.isOpen) {
+          this.deps.transport.sendMedia(payload);
+        }
+      },
+      onStarted: (info) => this.emit('background_audio.started', info),
+      onStopped: (info) => this.emit('background_audio.stopped', info),
+    });
     this.toolset = this.buildToolset();
     this.wireTransport();
   }
@@ -156,6 +185,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     });
     this.flushInboundBuffer();
     this.startMaxDurationWatchdog();
+    this.armIdleTimer();
     void this.saveSnapshot();
     this.maybeGreet();
   }
@@ -228,8 +258,21 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     throw new Error('multi-agent handoff is not wired yet for this session');
   }
 
-  submitToolResult(_toolCallId: string, _result: unknown): void {
-    throw new Error('deferred tool results are not wired yet for this session');
+  /** Complete a `deferred` tool call from the host side. */
+  submitToolResult(toolCallId: string, result: unknown): void {
+    this.completeDeferredFromHost(toolCallId, result);
+  }
+
+  /** Start background audio manually (independent of tools). */
+  async playBackgroundAudio(
+    spec: BackgroundAudioSpec,
+    options: BackgroundAudioOptions = {},
+  ): Promise<void> {
+    this.bgAudio.start(spec, { startDelayMs: 0, ...options });
+  }
+
+  async stopBackgroundAudio(options: { fadeOutMs?: number } = {}): Promise<void> {
+    this.bgAudio.stop({ immediate: !options.fadeOutMs });
   }
 
   /** Immediate teardown (no goodbye). */
@@ -272,11 +315,14 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       instructions: this.activeAgentValue.resolveInstructions(this.context),
       voice: this.activeAgentValue.voice,
       vad: this.deps.options.vad,
-      tools: [...this.toolset.values()].map((tool) => ({
-        name: tool.name,
-        description: tool.description,
-        parameters: tool.parametersJsonSchema,
-      })),
+      tools: [...this.toolset.values()].map((tool) => {
+        const decorated = decorateTool(tool, this.middlewares);
+        return {
+          name: tool.name,
+          description: decorated.description,
+          parameters: decorated.parameters,
+        };
+      }),
       providerOptions: this.activeAgentValue.providerOptions,
     };
   }
@@ -285,7 +331,11 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     const { transport } = this.deps;
     transport.on('media', (event) => this.handleInboundMedia(event.media.payload));
     transport.on('mark', (event) => this.handleMarkEcho(event.mark.name));
-    transport.on('dtmf', (event) => this.emit('dtmf', { digit: event.dtmf.digit }));
+    transport.on('dtmf', (event) => {
+      this.clearIdleTimer();
+      this.nudgeCount = 0;
+      this.emit('dtmf', { digit: event.dtmf.digit });
+    });
     transport.on('stop', () => void this.teardown('caller-hangup'));
     transport.on('close', () => void this.teardown('caller-hangup'));
     transport.on('error', (error) => this.emit('error', error));
@@ -295,6 +345,9 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     provider.on('audio', (delta) => {
       if (this.stateValue !== 'active' && this.stateValue !== 'ending') return;
       if (!this.deps.transport.isOpen) return;
+      // Real agent speech preempts any hold loop instantly (no fade, no clear:
+      // clearing would flush this very delta out of Twilio's buffer).
+      this.bgAudio.notifyAgentAudio();
       this.deps.transport.sendMedia(delta.base64Mulaw);
       const chunkMs = base64ByteLength(delta.base64Mulaw) / 8;
       const markName = this.tracker.onAudioSent(delta.responseId, chunkMs, delta.itemId);
@@ -305,6 +358,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       this.generating = true;
       this.currentResponseId = responseId;
       if (this.pendingHangup) this.pendingHangup.sawResponse = true;
+      this.clearIdleTimer();
       this.interruptions.onResponseStarted(responseId);
       this.emit('agent.speech.started', { responseId });
     });
@@ -348,10 +402,13 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
         timestampMs: Date.now() - this.startedAtMs,
       };
       this.transcriptEntries.push(entry);
+      this.nudgeCount = 0;
       this.emit('transcript.user', entry);
     });
 
     provider.on('userSpeechStarted', () => {
+      this.clearIdleTimer();
+      this.nudgeCount = 0;
       this.emit('user.speech.started');
       this.handleBargeIn();
     });
@@ -416,6 +473,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     this.flushToolQueue();
     void this.executePendingTransfer();
     this.maybeCompleteHangup();
+    this.armIdleTimer();
   }
 
   // ---- interruption --------------------------------------------------------
@@ -497,42 +555,160 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       return;
     }
 
+    const input = parsed.data;
+    this.emit('tool.started', { ...baseInfo, strategy: tool.strategy, input });
+
+    switch (tool.strategy) {
+      case 'sync':
+        await this.runForegroundTool(tool, call, input, started);
+        break;
+
+      case 'dispatch': {
+        // Fire-and-forget: the model gets an immediate ack and keeps talking.
+        this.deliverToolResult(call.id, {
+          status: 'queued',
+          note: 'The task was dispatched and runs in the background. Continue the conversation naturally; do not mention internal processing.',
+        });
+        void this.runDetachedTool(tool, call, input, started, (outcome) => {
+          if (outcome.ok) {
+            this.emit('tool.completed', {
+              ...baseInfo,
+              strategy: tool.strategy,
+              input,
+              result: outcome.result,
+              durationMs: Date.now() - started,
+            });
+          } else {
+            this.emit('tool.failed', {
+              ...baseInfo,
+              strategy: tool.strategy,
+              error: outcome.message,
+              durationMs: Date.now() - started,
+            });
+          }
+        });
+        break;
+      }
+
+      case 'deferred': {
+        // The model acknowledges and keeps talking; the real result is
+        // injected as a new turn when it arrives (from execute() OR from
+        // session.submitToolResult(), whichever comes first).
+        this.deferredPending.set(call.id, { toolName: call.name });
+        this.deliverToolResult(call.id, {
+          status: 'pending',
+          note: 'The result is being prepared and will arrive shortly as a system message. Tell the caller you are looking into it and continue naturally.',
+        });
+        void this.runDetachedTool(tool, call, input, started, (outcome) => {
+          if (outcome.ok) {
+            this.completeDeferred(call.id, call.name, outcome.result);
+            this.emit('tool.completed', {
+              ...baseInfo,
+              strategy: tool.strategy,
+              input,
+              result: outcome.result,
+              durationMs: Date.now() - started,
+            });
+          } else {
+            this.completeDeferred(call.id, call.name, { error: outcome.message });
+            this.emit('tool.failed', {
+              ...baseInfo,
+              strategy: tool.strategy,
+              error: outcome.message,
+              durationMs: Date.now() - started,
+            });
+          }
+        });
+        break;
+      }
+
+      case 'humanInTheLoop':
+        this.requestApproval(tool, call, input);
+        break;
+    }
+  }
+
+  /** sync path (also the approved HITL path): hold audio, execute, deliver. */
+  private async runForegroundTool(
+    tool: Tool,
+    call: ProviderToolCall,
+    input: unknown,
+    started: number,
+  ): Promise<void> {
+    const baseInfo = { toolCallId: call.id, toolName: call.name, agentId: this.activeAgentValue.id };
+    this.acquireHoldAudio(call.id, tool);
+    try {
+      const outcome = await this.executeToolBody(tool, call, input);
+      if (outcome.ok) {
+        this.deliverToolResult(call.id, outcome.result ?? { ok: true });
+        this.emit('tool.completed', {
+          ...baseInfo,
+          strategy: tool.strategy,
+          input,
+          result: outcome.result,
+          durationMs: Date.now() - started,
+        });
+        void this.saveSnapshot();
+      } else {
+        this.deliverToolResult(call.id, outcome.payload);
+        this.emit('tool.failed', {
+          ...baseInfo,
+          strategy: tool.strategy,
+          error: outcome.message,
+          durationMs: Date.now() - started,
+        });
+      }
+    } finally {
+      this.bgAudio.release(call.id);
+    }
+  }
+
+  /** dispatch/deferred body — no hold audio (the model keeps talking). */
+  private async runDetachedTool(
+    tool: Tool,
+    call: ProviderToolCall,
+    input: unknown,
+    _started: number,
+    onOutcome: (outcome: ToolOutcome) => void,
+  ): Promise<void> {
+    const outcome = await this.executeToolBody(tool, call, input);
+    onOutcome(outcome);
+  }
+
+  /** Shared execution core: abort/timeout, middleware onion, per-tool hooks. */
+  private async executeToolBody(
+    tool: Tool,
+    call: ProviderToolCall,
+    initialInput: unknown,
+  ): Promise<ToolOutcome> {
     const controller = new AbortController();
     this.runningTools.set(call.id, controller);
     const timeoutMs = tool.timeoutMs ?? 15_000;
     const timeout = setTimeout(() => controller.abort(new Error('tool timed out')), timeoutMs);
     this.timers.add(timeout);
     const ctx = this.buildToolContext(call.id, controller.signal);
-
-    this.emit('tool.started', { ...baseInfo, strategy: tool.strategy, input: parsed.data });
     try {
-      let input = parsed.data;
-      if (tool.onBeforeExecute) {
-        const replaced = await tool.onBeforeExecute(input, ctx);
-        if (replaced !== undefined) input = replaced;
-      }
-      let result: unknown = await this.raceAbort(
-        Promise.resolve(tool.execute(input, ctx)),
-        controller.signal,
-      );
-      if (tool.onAfterExecute) {
-        const replaced = await tool.onAfterExecute(result, ctx);
-        if (replaced !== undefined) result = replaced;
-      }
-      this.deliverToolResult(call.id, result ?? { ok: true });
-      this.emit('tool.completed', {
-        ...baseInfo,
-        strategy: tool.strategy,
-        input,
-        result,
-        durationMs: Date.now() - started,
-      });
-      void this.saveSnapshot();
-    } catch (error) {
-      let payload: unknown = {
-        error: 'tool_failed',
-        message: error instanceof Error ? error.message : String(error),
+      let input = initialInput;
+      const innermost = async (): Promise<unknown> => {
+        if (tool.onBeforeExecute) {
+          const replaced = await tool.onBeforeExecute(input, ctx);
+          if (replaced !== undefined) input = replaced;
+        }
+        let result: unknown = await this.raceAbort(
+          Promise.resolve(tool.execute(input, ctx)),
+          controller.signal,
+        );
+        if (tool.onAfterExecute) {
+          const replaced = await tool.onAfterExecute(result, ctx);
+          if (replaced !== undefined) result = replaced;
+        }
+        return result;
       };
+      const result = await composeExecution(tool, input, ctx, this.middlewares, innermost);
+      return { ok: true, result };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      let payload: unknown = { error: 'tool_failed', message };
       if (tool.onError) {
         try {
           const replaced = await tool.onError(error, ctx);
@@ -541,18 +717,114 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
           /* onError itself failed; keep the generic payload */
         }
       }
-      this.deliverToolResult(call.id, payload);
-      this.emit('tool.failed', {
-        ...baseInfo,
-        strategy: tool.strategy,
-        error: error instanceof Error ? error.message : String(error),
-        durationMs: Date.now() - started,
-      });
+      return { ok: false, payload, message };
     } finally {
       clearTimeout(timeout);
       this.timers.delete(timeout);
       this.runningTools.delete(call.id);
     }
+  }
+
+  // ---- deferred + human-in-the-loop ---------------------------------------
+
+  /** Inject a deferred result as a conversation turn (idempotent per call). */
+  private completeDeferred(callId: string, toolName: string, result: unknown): void {
+    if (!this.deferredPending.delete(callId)) return; // already completed
+    if (this.stateValue === 'ended') return;
+    const text = `[Tool "${toolName}" finished] Result: ${safeJsonStringify(result)}. Share what is relevant with the caller now.`;
+    this.injectOrQueueText(text, true);
+  }
+
+  /** Complete a deferred tool from the host (webhook, operator console…). */
+  private completeDeferredFromHost(toolCallId: string, result: unknown): void {
+    const pending = this.deferredPending.get(toolCallId);
+    if (!pending) {
+      this.log.warn('submitToolResult for unknown/settled tool call', { toolCallId });
+      return;
+    }
+    this.completeDeferred(toolCallId, pending.toolName, result);
+  }
+
+  private requestApproval(tool: Tool, call: ProviderToolCall, input: unknown): void {
+    const timeoutMs = tool.approvalTimeoutMs ?? 30_000;
+    const timer = setTimeout(() => {
+      this.rejectTool(call.id, 'approval timed out');
+    }, timeoutMs);
+    timer.unref?.();
+    this.timers.add(timer);
+    this.approvals.set(call.id, { call, tool, input, timer });
+    // The caller waits in silence while a human decides — hold audio matters.
+    this.acquireHoldAudio(call.id, tool);
+    this.emit('tool.approval.required', {
+      approvalId: call.id,
+      toolCallId: call.id,
+      toolName: call.name,
+      input,
+      agentId: this.activeAgentValue.id,
+      expiresAtMs: Date.now() + timeoutMs,
+    });
+  }
+
+  /** Approve a pending humanInTheLoop tool call (optionally editing input). */
+  approveTool(approvalId: string, editedInput?: unknown): void {
+    const entry = this.approvals.get(approvalId);
+    if (!entry) {
+      this.log.warn('approveTool for unknown approval', { approvalId });
+      return;
+    }
+    this.approvals.delete(approvalId);
+    clearTimeout(entry.timer);
+    this.timers.delete(entry.timer);
+    void this.runForegroundTool(
+      entry.tool,
+      entry.call,
+      editedInput !== undefined ? editedInput : entry.input,
+      Date.now(),
+    );
+  }
+
+  /** Reject a pending humanInTheLoop tool call. */
+  rejectTool(approvalId: string, reason?: string): void {
+    const entry = this.approvals.get(approvalId);
+    if (!entry) return;
+    this.approvals.delete(approvalId);
+    clearTimeout(entry.timer);
+    this.timers.delete(entry.timer);
+    this.bgAudio.release(approvalId);
+    this.deliverToolResult(approvalId, {
+      error: 'rejected',
+      message: reason ?? 'A human operator declined this action. Tell the caller it cannot be done right now.',
+    });
+    this.emit('tool.failed', {
+      toolCallId: approvalId,
+      toolName: entry.call.name,
+      strategy: entry.tool.strategy,
+      agentId: this.activeAgentValue.id,
+      error: reason ?? 'rejected by operator',
+    });
+  }
+
+  private acquireHoldAudio(holderId: string, tool: Tool): void {
+    if (tool.backgroundAudio === false) return;
+    const sessionDefault = this.deps.options.toolBackgroundAudio;
+    const spec: BackgroundAudioSpec | undefined = tool.backgroundAudio ?? sessionDefault?.spec;
+    if (!spec) return;
+    this.bgAudio.acquire(holderId, spec, {
+      volume: sessionDefault?.volume,
+      fadeInMs: sessionDefault?.fadeInMs,
+      fadeOutMs: sessionDefault?.fadeOutMs,
+      startDelayMs: sessionDefault?.startDelayMs,
+      maxDurationMs: sessionDefault?.maxDurationMs,
+    });
+  }
+
+  /** Inject a text turn now, or after the agent finishes speaking. */
+  private injectOrQueueText(text: string, triggerResponse: boolean): void {
+    if (this.generating || this.tracker.isPlaybackActive()) {
+      this.pendingInjections.push({ text, triggerResponse });
+      return;
+    }
+    this.provider?.sendText(text, { role: 'system', triggerResponse });
   }
 
   private raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -592,6 +864,14 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
         triggerResponse: item.triggerResponse,
       });
     }
+    const injections = this.pendingInjections;
+    this.pendingInjections = [];
+    for (const injection of injections) {
+      this.provider.sendText(injection.text, {
+        role: 'system',
+        triggerResponse: injection.triggerResponse,
+      });
+    }
   }
 
   private buildToolContext(toolCallId: string, signal: AbortSignal): ToolContext {
@@ -601,10 +881,8 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       finishCall: (options) => this.finishCall(options),
       transferTo: (phoneNumber, options) => this.transferTo(phoneNumber, options),
       handoffTo: (agent) => this.handoffTo(agent),
-      playBackgroundAudio: async () => {
-        throw new Error('background audio is not wired yet for this session');
-      },
-      stopBackgroundAudio: async () => {},
+      playBackgroundAudio: (spec, options) => this.playBackgroundAudio(spec, options),
+      stopBackgroundAudio: (options) => this.stopBackgroundAudio(options),
       submitToolResult: (id, result) => this.submitToolResult(id, result),
     };
     return {
@@ -673,8 +951,9 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     }
     this.stateValue = 'ending';
     const rest = this.deps.rest;
+    const reason = this.hangupReason;
     const finish = () =>
-      void this.teardown('agent-hangup').then(() => {
+      void this.teardown(reason).then(() => {
         pending?.resolvers.forEach((resolve) => resolve());
       });
     if (rest) {
@@ -754,6 +1033,55 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     );
   }
 
+  // ---- idle nudges ---------------------------------------------------------
+
+  /** Armed whenever the agent goes quiet and we're waiting on the caller. */
+  private armIdleTimer(): void {
+    const idle = this.deps.options.idle;
+    if (!idle || this.stateValue !== 'active' || this.pendingHangup) return;
+    this.clearIdleTimer();
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      this.onIdleTimeout();
+    }, idle.timeoutSeconds * 1000);
+    this.idleTimer.unref?.();
+  }
+
+  private clearIdleTimer(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+  }
+
+  private onIdleTimeout(): void {
+    const idle = this.deps.options.idle;
+    if (!idle || this.stateValue !== 'active' || !this.provider?.isConnected) return;
+    if (this.generating || this.tracker.isPlaybackActive() || this.runningTools.size > 0) {
+      this.armIdleTimer();
+      return;
+    }
+    const prompts = idle.prompts?.length
+      ? idle.prompts
+      : ['The caller has gone quiet. Gently check if they are still there.'];
+    const maxNudges = idle.maxNudges ?? prompts.length;
+    if (this.nudgeCount < maxNudges) {
+      const prompt = prompts[Math.min(this.nudgeCount, prompts.length - 1)]!;
+      this.nudgeCount++;
+      this.provider.createResponse({ instructions: prompt });
+      // Re-armed by that nudge's playback.finished.
+      return;
+    }
+    this.log.info('caller idle beyond nudges — ending call');
+    this.hangupReason = 'idle-timeout';
+    this.provider.createResponse({
+      instructions:
+        idle.goodbye ??
+        'You could not hear the caller anymore. Say a brief goodbye and that they are welcome to call back, then stop speaking.',
+    });
+    void this.armHangup();
+  }
+
   // ---- watchdogs -----------------------------------------------------------
 
   private startMaxDurationWatchdog(): void {
@@ -782,10 +1110,16 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
     for (const timer of this.timers) clearTimeout(timer);
     this.timers.clear();
+    this.clearIdleTimer();
+    this.bgAudio.stop({ immediate: true });
     for (const controller of this.runningTools.values()) {
       controller.abort(new Error('call ended'));
     }
     this.runningTools.clear();
+    for (const approval of this.approvals.values()) clearTimeout(approval.timer);
+    this.approvals.clear();
+    this.deferredPending.clear();
+    this.pendingInjections = [];
     this.toolQueue.clear();
     this.inboundBuffer = [];
 
@@ -831,5 +1165,15 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     } catch (error) {
       this.log.warn('session store save failed', { error: String(error) });
     }
+  }
+}
+
+type ToolOutcome = { ok: true; result: unknown } | { ok: false; payload: unknown; message: string };
+
+function safeJsonStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? 'null';
+  } catch {
+    return String(value);
   }
 }

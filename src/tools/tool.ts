@@ -9,12 +9,17 @@ export interface ZodSchemaLike {
     | { success: false; error: { message?: string; issues?: unknown[] } };
 }
 
+type IsAny<T> = 0 extends 1 & T ? true : false;
+
 /** Output type of a Zod schema, for either Zod major. */
-export type InferSchema<S> = S extends { _zod: { output: infer O } }
-  ? O
-  : S extends { _output: infer O }
-    ? O
-    : unknown;
+export type InferSchema<S> =
+  IsAny<S> extends true
+    ? any
+    : S extends { _zod: { output: infer O } }
+      ? O
+      : S extends { _output: infer O }
+        ? O
+        : unknown;
 
 /**
  * How a tool call is executed relative to the conversation:

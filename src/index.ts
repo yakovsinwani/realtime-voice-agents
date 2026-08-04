@@ -51,6 +51,12 @@ export {
   type ToolCallInfo,
 } from './tools/context.js';
 export { zodToJsonSchema } from './tools/json-schema.js';
+export {
+  decorateTool,
+  composeExecution,
+  type ToolMiddleware,
+  type ToolDecoration,
+} from './tools/middleware.js';
 export { createFinishCallTool, type FinishCallToolOptions } from './tools/builtins/finishCall.js';
 export { createTransferCallTool, type TransferCallToolOptions } from './tools/builtins/transferCall.js';
 

@@ -13,6 +13,7 @@ import { TypedEmitter } from '../internal/events.js';
 import { noopLogger, type Logger } from '../logging/logger.js';
 import { InMemorySessionStore } from '../session/InMemorySessionStore.js';
 import type { SessionStore } from '../session/SessionStore.js';
+import type { ToolMiddleware } from '../tools/middleware.js';
 import { TwilioMediaTransport, type WebSocketLike } from '../twilio/transport.js';
 import { TwilioRestClient } from '../twilio/rest.js';
 import { CallSession } from './CallSession.js';
@@ -31,6 +32,7 @@ export class TwilioRealtimeBridge extends TypedEmitter<BridgeEventMap> {
   private readonly sessionsBySid = new Map<string, CallSession>();
   /** Status callbacks can beat the media stream; remember early answers. */
   private readonly answeredEarly = new Set<string>();
+  private readonly middlewares: ToolMiddleware[] = [];
   private closed = false;
 
   constructor(config: BridgeConfig) {
@@ -59,6 +61,15 @@ export class TwilioRealtimeBridge extends TypedEmitter<BridgeEventMap> {
     }
     const transport = new TwilioMediaTransport(ws);
     void this.handshake(transport, request);
+  }
+
+  /**
+   * Register cross-cutting tool middleware (first registered wraps
+   * outermost). Applies to sessions created after the call.
+   */
+  use(middleware: ToolMiddleware): this {
+    this.middlewares.push(middleware);
+    return this;
   }
 
   getSession(callSid: string): CallSession | undefined {
@@ -149,6 +160,7 @@ export class TwilioRealtimeBridge extends TypedEmitter<BridgeEventMap> {
         builtinTools: this.config.builtinTools,
         rest: this.rest,
         restCallerId: this.config.twilio?.callerId,
+        middlewares: this.middlewares,
         answeredEarly,
         onEnded: (sid, reason) => this.onSessionEnded(sid, reason),
       });
