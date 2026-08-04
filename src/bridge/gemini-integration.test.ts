@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Agent } from '../agents/Agent.js';
 import { geminiLive } from '../gemini.js';
 import { FakeGeminiLive } from '../testing/FakeGeminiLive.js';
-import { FakeTwilioMediaStream, mulawSilenceBase64 } from '../testing/FakeTwilioMediaStream.js';
+import { FakeTwilioMediaStream } from '../testing/FakeTwilioMediaStream.js';
 import { TwilioRealtimeBridge } from './TwilioRealtimeBridge.js';
 import type { CallSession } from './CallSession.js';
 

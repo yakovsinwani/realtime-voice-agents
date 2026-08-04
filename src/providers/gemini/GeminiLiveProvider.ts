@@ -190,7 +190,8 @@ export class GeminiLiveProvider extends BaseRealtimeProvider {
       genai = await import('@google/genai');
     } catch (error) {
       throw new Error(
-        `the '@google/genai' package is required for the Gemini provider — npm install @google/genai (${String(error)})`,
+        "the '@google/genai' package is required for the Gemini provider — npm install @google/genai",
+        { cause: error },
       );
     }
     const { GoogleGenAI } = genai;
