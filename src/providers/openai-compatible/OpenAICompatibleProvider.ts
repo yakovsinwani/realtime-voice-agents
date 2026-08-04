@@ -17,6 +17,7 @@ import {
   type ProviderSessionInit,
   type SendTextOptions,
   type SendToolResultOptions,
+  type VadConfig,
 } from '../base/BaseRealtimeProvider.js';
 import type { ProviderCapabilities } from '../base/capabilities.js';
 import type { ProviderUsage } from '../base/events.js';
@@ -29,7 +30,7 @@ export interface OpenAICompatibleProviderConfig {
   baseUrl?: string;
   voice?: string;
   /** VAD used when the session init doesn't specify one. `null` disables. */
-  defaultVad?: import('../base/BaseRealtimeProvider.js').VadConfig | null;
+  defaultVad?: VadConfig | null;
   /** Transcription used when the session init doesn't specify one. */
   defaultTranscription?: { model?: string; language?: string } | false;
   headers?: Record<string, string>;
