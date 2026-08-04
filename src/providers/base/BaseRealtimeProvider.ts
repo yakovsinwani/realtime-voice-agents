@@ -39,7 +39,8 @@ export interface ProviderSessionInit {
 }
 
 export interface SendTextOptions {
-  role?: 'user' | 'system';
+  /** `assistant` is used for history re-injection after reconnect/handoff. */
+  role?: 'user' | 'system' | 'assistant';
   /** Ask the model to respond immediately after the text lands. Default true. */
   triggerResponse?: boolean;
 }

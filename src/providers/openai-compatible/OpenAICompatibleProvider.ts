@@ -198,12 +198,14 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
   }
 
   sendText(text: string, options: SendTextOptions = {}): void {
+    const role = options.role ?? 'user';
     this.send({
       type: 'conversation.item.create',
       item: {
         type: 'message',
-        role: options.role ?? 'user',
-        content: [{ type: 'input_text', text }],
+        role,
+        // Assistant items carry output_text content; user/system carry input_text.
+        content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text }],
       },
     });
     if (options.triggerResponse !== false) this.createResponse();

@@ -19,3 +19,8 @@ export {
   type AwaitStartOptions,
 } from './transport.js';
 export { connectStreamTwiml, escapeXml, type ConnectStreamTwimlOptions } from './twiml.js';
+export {
+  TwilioRestClient,
+  assertValidPhoneNumber,
+  type TwilioRestConfig,
+} from './rest.js';
