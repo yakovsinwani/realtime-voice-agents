@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { setTimeout as delay } from 'node:timers/promises';
 import { FakeOpenAIServer } from '../../testing/FakeOpenAIServer.js';
 import { OpenAICompatibleProvider } from './OpenAICompatibleProvider.js';
 import type { ProviderSessionInit } from '../base/BaseRealtimeProvider.js';
@@ -8,6 +9,15 @@ const INIT: ProviderSessionInit = {
   voice: 'marin',
   tools: [{ name: 'noop', parameters: { type: 'object', properties: {} } }],
 };
+
+async function waitFor(predicate: () => boolean, timeoutMs = 2000, what = 'condition'): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await delay(5);
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
 
 describe('OpenAICompatibleProvider against FakeOpenAIServer', () => {
   let server: FakeOpenAIServer;
@@ -131,6 +141,86 @@ describe('OpenAICompatibleProvider against FakeOpenAIServer', () => {
     server.latest.drop(1011);
     await new Promise((r) => setTimeout(r, 50));
     expect(closes).toEqual([expect.objectContaining({ code: 1011, retriable: true })]);
+  });
+
+  it('does not offer permessage-deflate on the provider socket', async () => {
+    await provider.connect(INIT);
+    // Realtime audio path: zlib per delta adds latency jitter for no gain.
+    expect(server.latest.upgradeHeaders['sec-websocket-extensions']).toBeUndefined();
+  });
+
+  it('holds response.create while a response is active, sends it on response.done', async () => {
+    await provider.connect(INIT);
+    let started = 0;
+    provider.on('responseStarted', () => started++);
+    server.latest.send({ type: 'response.created', response: { id: 'busy' } });
+    await waitFor(() => started === 1, 2000, 'responseStarted');
+
+    provider.createResponse({ instructions: 'Say goodbye now.' });
+    await delay(50);
+    expect(server.latest.eventsOfType('response.create')).toHaveLength(0);
+
+    server.latest.send({ type: 'response.done', response: { id: 'busy', status: 'completed' } });
+    const create = await server.latest.waitForEvent('response.create');
+    expect(create.response?.instructions).toBe('Say goodbye now.');
+  });
+
+  it('coalesces creates queued during a response; instructions survive a later bare create', async () => {
+    await provider.connect(INIT);
+    let started = 0;
+    provider.on('responseStarted', () => started++);
+    server.latest.send({ type: 'response.created', response: { id: 'busy' } });
+    await waitFor(() => started === 1, 2000, 'responseStarted');
+
+    provider.createResponse();
+    provider.createResponse({ instructions: 'Wrap up the call.' });
+    provider.createResponse();
+
+    server.latest.send({ type: 'response.done', response: { id: 'busy', status: 'completed' } });
+    const create = await server.latest.waitForEvent('response.create');
+    expect(create.response?.instructions).toBe('Wrap up the call.');
+    await delay(50);
+    expect(server.latest.eventsOfType('response.create')).toHaveLength(1);
+  });
+
+  it('treats conversation_already_has_active_response as benign and re-arms the create', async () => {
+    await provider.connect(INIT);
+    const errors: Error[] = [];
+    provider.on('error', (error) => errors.push(error));
+
+    provider.createResponse({ instructions: 'Announce the transfer.' });
+    await server.latest.waitForEvent('response.create');
+    // A VAD-created response beat us to it — the server rejects our create.
+    server.latest.sendError({
+      type: 'invalid_request_error',
+      code: 'conversation_already_has_active_response',
+      message: 'Conversation already has an active response in progress: resp_vad.',
+    });
+    await delay(50);
+    expect(errors).toHaveLength(0);
+
+    // The response that beat us completes → the rejected create fires again.
+    server.latest.send({ type: 'response.done', response: { id: 'resp_vad', status: 'completed' } });
+    await waitFor(
+      () => server.latest.eventsOfType('response.create').length === 2,
+      2000,
+      'retried response.create',
+    );
+    const retried = server.latest.eventsOfType('response.create')[1]!;
+    expect(retried.response?.instructions).toBe('Announce the transfer.');
+  });
+
+  it('ignores response_cancel_not_active errors', async () => {
+    await provider.connect(INIT);
+    const errors: Error[] = [];
+    provider.on('error', (error) => errors.push(error));
+    server.latest.sendError({
+      type: 'invalid_request_error',
+      code: 'response_cancel_not_active',
+      message: 'Cancellation failed: no active response found',
+    });
+    await delay(50);
+    expect(errors).toHaveLength(0);
   });
 
   it('rejects connect when the server closes with a policy code during setup', async () => {

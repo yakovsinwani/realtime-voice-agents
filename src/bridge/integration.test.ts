@@ -226,6 +226,57 @@ describe('bridge end-to-end (FakeTwilio ⇄ bridge ⇄ FakeOpenAI)', () => {
     expect(JSON.parse(output.item.output)).toEqual({ checked: true });
   });
 
+  it('flushes multiple queued tool results with a single response.create', async () => {
+    const mk = (name: string) =>
+      tool({
+        name,
+        description: name,
+        parameters: z.object({}),
+        execute: async () => ({ ran: name }),
+      });
+    bridge = makeBridge({
+      agent: new Agent({ name: 'S', instructions: 'x', tools: [mk('tool_a'), mk('tool_b')] }),
+    });
+    const session = await connectCall();
+    let completed = 0;
+    session.on('tool.completed', () => completed++);
+
+    // Agent mid-utterance: both results must queue behind the playback.
+    server.latest.sendAudioResponse({
+      responseId: 'talk',
+      chunks: [mulawSilenceBase64(400)],
+    });
+    await waitFor(() => fake.sentMediaPayloads.length === 1, 2000, 'audio at Twilio');
+    server.latest.sendToolCall({ name: 'tool_a', argumentsJson: '{}' });
+    server.latest.sendToolCall({ name: 'tool_b', argumentsJson: '{}' });
+    await waitFor(() => completed === 2, 2000, 'both tools completed');
+    const createsBefore = server.latest.eventsOfType('response.create').length;
+
+    fake.playAll();
+    await waitFor(
+      () =>
+        server.latest.received.filter(
+          (f) => f.type === 'conversation.item.create' && f.item?.type === 'function_call_output',
+        ).length === 2,
+      2000,
+      'both results flushed',
+    );
+    await delay(80); // a (buggy) second create would arrive in this window
+    // N results, one response: back-to-back creates would trip the GA
+    // active-response rejection mid-call.
+    expect(server.latest.eventsOfType('response.create')).toHaveLength(createsBefore + 1);
+  });
+
+  it('survives a fatal provider error when the host attached no error listener', async () => {
+    bridge = makeBridge();
+    const session = await connectCall();
+    // Deliberately no session.on('error'): an unhandled 'error' emit must not
+    // throw (Node would take the whole host process down otherwise).
+    server.latest.sendError({ type: 'server_error', code: 'internal_error', message: 'boom' });
+    await delay(60);
+    expect(session.state).toBe('active');
+  });
+
   it('finish_call builtin: goodbye plays fully, then the call ends', async () => {
     bridge = makeBridge({ builtinTools: { finishCall: true } });
     const session = await connectCall();

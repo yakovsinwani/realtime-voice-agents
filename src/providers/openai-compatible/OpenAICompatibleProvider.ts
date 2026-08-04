@@ -53,6 +53,13 @@ export interface OpenAICompatibleProviderConfig {
 
 const DEFAULT_BASE_URL = 'wss://api.openai.com/v1/realtime';
 
+/** A response.create waiting for the active response to finish. `attempts`
+ * bounds the raced-create retry so a confused server can't cause a loop. */
+interface PendingResponseCreate {
+  instructions?: string;
+  attempts: number;
+}
+
 /** WS close codes where retrying cannot help (protocol/auth/policy failures). */
 const NON_RETRIABLE_CLOSE_CODES = new Set([1002, 1003, 1007, 1008]);
 
@@ -67,6 +74,17 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
   private ready = false;
   private intentionalClose = false;
   private currentResponseId: string | null = null;
+  /**
+   * response.create serialization. The GA API rejects a `response.create`
+   * issued while another response is in flight
+   * (`conversation_already_has_active_response`), so creates requested
+   * mid-response wait in a single pending slot and fire on `response.done`.
+   * Later requests coalesce into that slot — one response reads the whole
+   * conversation state, so only the instructions payload is worth keeping.
+   */
+  private responseActive = false;
+  private pendingCreate: PendingResponseCreate | null = null;
+  private lastCreateSent: PendingResponseCreate | null = null;
 
   constructor(config: OpenAICompatibleProviderConfig, logger: Logger = noopLogger) {
     super();
@@ -98,6 +116,10 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
     };
     this.intentionalClose = false;
     this.ready = false;
+    this.responseActive = false;
+    this.pendingCreate = null;
+    this.lastCreateSent = null;
+    this.currentResponseId = null;
 
     const url = `${this.config.baseUrl ?? DEFAULT_BASE_URL}?model=${encodeURIComponent(this.config.model)}`;
     const ws = new WebSocket(url, {
@@ -105,6 +127,9 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
         Authorization: `Bearer ${this.config.apiKey}`,
         ...this.config.headers,
       },
+      // Realtime audio: per-message zlib adds latency jitter (ws inflates every
+      // delta through its async zlib queue) for negligible gain on base64 μ-law.
+      perMessageDeflate: false,
     });
     this.ws = ws;
 
@@ -230,9 +255,23 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
   }
 
   createResponse(options: { instructions?: string } = {}): void {
+    if (this.responseActive) {
+      // Coalesce: explicit instructions win over (and survive) a bare
+      // "respond now" — the eventual response covers all requests.
+      this.pendingCreate = {
+        instructions: options.instructions ?? this.pendingCreate?.instructions,
+        attempts: 0,
+      };
+      return;
+    }
+    this.sendCreate({ instructions: options.instructions, attempts: 0 });
+  }
+
+  private sendCreate(create: PendingResponseCreate): void {
+    this.lastCreateSent = create;
     this.send({
       type: 'response.create',
-      ...(options.instructions ? { response: { instructions: options.instructions } } : {}),
+      ...(create.instructions ? { response: { instructions: create.instructions } } : {}),
     });
   }
 
@@ -251,6 +290,9 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
   }
 
   override cancelResponse(): void {
+    // A pending bare "respond now" is stale once the turn is being killed;
+    // pending instructions (goodbye, announcement) must still fire.
+    if (this.pendingCreate && !this.pendingCreate.instructions) this.pendingCreate = null;
     this.send({ type: 'response.cancel' });
   }
 
@@ -270,6 +312,7 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
       case 'response.created': {
         const responseId = event.response?.id ?? `resp_${Date.now()}`;
         this.currentResponseId = responseId;
+        this.responseActive = true;
         this.emit('responseStarted', { responseId });
         break;
       }
@@ -318,6 +361,10 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
         break;
       }
       case 'input_audio_buffer.speech_started':
+        // The caller is talking: their turn will trigger the next response, so
+        // a pending bare create is stale (firing it would talk over them).
+        // Pending instructions (goodbye, nudge) survive.
+        if (this.pendingCreate && !this.pendingCreate.instructions) this.pendingCreate = null;
         this.emit('userSpeechStarted');
         break;
       case 'input_audio_buffer.speech_stopped':
@@ -326,6 +373,14 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
       case 'response.done': {
         const responseId = event.response?.id ?? this.currentResponseId ?? '';
         const usage = normalizeUsage(event.response?.usage);
+        this.responseActive = false;
+        // Flush before emitting: the pending create predates whatever the
+        // session's responseDone listeners decide to send next.
+        const pending = this.pendingCreate;
+        if (pending) {
+          this.pendingCreate = null;
+          this.sendCreate(pending);
+        }
         if (usage) this.emit('usage', usage);
         this.emit('responseDone', { responseId, usage: usage ?? undefined });
         break;
@@ -341,6 +396,26 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
         break;
       }
       case 'error': {
+        const code = event.error?.code;
+        if (code === 'conversation_already_has_active_response') {
+          // Our create raced a server-created response (VAD turn) — the call
+          // is healthy; the response we asked for just never started. Re-arm
+          // it (bounded) to fire when the active one completes.
+          this.responseActive = true;
+          const last = this.lastCreateSent;
+          if (last && last.attempts < 2 && !this.pendingCreate) {
+            this.pendingCreate = { ...last, attempts: last.attempts + 1 };
+          }
+          this.logger.warn('response.create raced an active response; deferred until it completes', {
+            error: event.error,
+          });
+          break;
+        }
+        if (code === 'response_cancel_not_active') {
+          // Cancel raced response.done — nothing left to interrupt.
+          this.logger.warn('response.cancel raced completion (ignored)', { error: event.error });
+          break;
+        }
         this.logger.warn('provider error event', { error: event.error });
         this.emit('error', new Error(`${this.name} error: ${JSON.stringify(event.error ?? event)}`));
         break;

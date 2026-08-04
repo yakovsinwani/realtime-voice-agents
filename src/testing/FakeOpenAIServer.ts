@@ -8,6 +8,7 @@
  * assertions.
  */
 
+import type { IncomingHttpHeaders } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import { WebSocketServer, type WebSocket } from 'ws';
 
@@ -33,11 +34,14 @@ export class FakeOpenAIConnection {
   readonly socket: WebSocket;
   /** Every parsed client → server frame, in order. */
   readonly received: Array<Record<string, any>> = [];
+  /** HTTP headers of the client's upgrade request (auth, extensions…). */
+  readonly upgradeHeaders: IncomingHttpHeaders;
   private readonly server: FakeOpenAIServer;
 
-  constructor(server: FakeOpenAIServer, socket: WebSocket) {
+  constructor(server: FakeOpenAIServer, socket: WebSocket, upgradeHeaders: IncomingHttpHeaders = {}) {
     this.server = server;
     this.socket = socket;
+    this.upgradeHeaders = upgradeHeaders;
   }
 
   /** Base64 payloads from input_audio_buffer.append frames. */
@@ -168,8 +172,8 @@ export class FakeOpenAIServer {
     this.wss = wss;
     this.url = url;
     this.options = options;
-    wss.on('connection', (socket) => {
-      const connection = new FakeOpenAIConnection(this, socket);
+    wss.on('connection', (socket, request) => {
+      const connection = new FakeOpenAIConnection(this, socket, request.headers);
       this.connections.push(connection);
       socket.on('message', (raw) => {
         let frame: Record<string, any>;

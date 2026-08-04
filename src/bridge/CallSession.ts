@@ -374,7 +374,15 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     });
     transport.on('stop', () => void this.teardown('caller-hangup'));
     transport.on('close', () => void this.teardown('caller-hangup'));
-    transport.on('error', (error) => this.emit('error', error));
+    transport.on('error', (error) => this.emitError(error));
+  }
+
+  /** Emit 'error'; when the host attached no listener, log instead of losing it. */
+  private emitError(error: Error): void {
+    if (this.listenerCount('error') === 0) {
+      this.log.error('session error (no "error" listener attached)', { error: String(error) });
+    }
+    this.emit('error', error);
   }
 
   private wireProvider(provider: BaseRealtimeProvider): void {
@@ -452,7 +460,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
     provider.on('toolCall', (call) => void this.handleToolCall(call));
 
-    provider.on('error', (error) => this.emit('error', error));
+    provider.on('error', (error) => this.emitError(error));
 
     provider.on('close', (info) => {
       if (this.stateValue === 'ended' || this.stateValue === 'ending') return;
@@ -934,9 +942,15 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
   private flushToolQueue(): void {
     if (this.stateValue === 'ended' || !this.provider?.isConnected) return;
-    for (const item of this.toolQueue.drain()) {
+    // One response covers every drained result, so only the last send may
+    // trigger it — per-item triggers would be N back-to-back response.creates,
+    // and the GA API rejects a create while the previous response is active.
+    // (Providers that auto-continue after tool results ignore the flag.)
+    const items = this.toolQueue.drain();
+    const wantTrigger = items.some((item) => item.triggerResponse);
+    for (const [index, item] of items.entries()) {
       this.provider.sendToolResult(item.callId, item.payload, {
-        triggerResponse: item.triggerResponse,
+        triggerResponse: wantTrigger && index === items.length - 1,
       });
     }
     const injections = this.pendingInjections;
@@ -1060,7 +1074,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       await this.teardown('transferred');
     } catch (error) {
       this.stateValue = 'active';
-      this.emit('error', error instanceof Error ? error : new Error(String(error)));
+      this.emitError(error instanceof Error ? error : new Error(String(error)));
       this.log.error('transfer failed; call stays with the agent', { error: String(error) });
     }
   }

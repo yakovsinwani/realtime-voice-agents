@@ -34,6 +34,10 @@ export class TypedEmitter<Events extends Record<string, Listener>> {
   }
 
   protected emit<K extends keyof Events & string>(event: K, ...args: Parameters<Events[K]>): boolean {
+    // Node throws on 'error' with zero listeners. A transient provider fault
+    // on one call must never take the host process down — drop the event
+    // instead (emit sites that need visibility log before emitting).
+    if (event === 'error' && this.emitter.listenerCount('error') === 0) return false;
     return this.emitter.emit(event, ...args);
   }
 
