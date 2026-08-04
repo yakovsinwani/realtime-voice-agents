@@ -14,6 +14,9 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # NPM_TOKEN is stored as an environment secret in the "secrets"
+    # environment — the job must declare it to resolve the secret.
+    environment: secrets
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
