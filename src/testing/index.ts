@@ -5,3 +5,4 @@ export {
   type FakeOpenAIServerOptions,
   type FakeAudioResponseOptions,
 } from './FakeOpenAIServer.js';
+export { FakeGeminiLive, FakeGeminiSession } from './FakeGeminiLive.js';

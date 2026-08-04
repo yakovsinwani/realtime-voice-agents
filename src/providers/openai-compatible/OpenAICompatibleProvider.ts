@@ -40,6 +40,15 @@ export interface OpenAICompatibleProviderConfig {
   capabilityOverrides?: Partial<ProviderCapabilities>;
   /** Provider display name for logs/events (e.g. 'openai', 'xai'). */
   providerName?: string;
+  /**
+   * Session payload builder override for OpenAI-compatible services whose
+   * session shape diverges (xAI puts voice/turn_detection at the session
+   * root). Defaults to the OpenAI GA builder.
+   */
+  buildSession?: (
+    init: ProviderSessionInit,
+    config: { defaultVoice?: string; extraSessionOptions?: Record<string, unknown> },
+  ) => Record<string, unknown>;
 }
 
 const DEFAULT_BASE_URL = 'wss://api.openai.com/v1/realtime';
@@ -125,10 +134,7 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
         if (!event) return;
         if (!settled) {
           if (event.type === 'session.created') {
-            this.send(buildSessionUpdate(this.sessionInit!, {
-              defaultVoice: this.config.voice,
-              extraSessionOptions: this.config.extraSessionOptions,
-            }));
+            this.send(this.buildSessionPayload());
             return;
           }
           if (event.type === 'session.updated') {
@@ -233,10 +239,15 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
   async updateSession(patch: Partial<ProviderSessionInit>): Promise<void> {
     if (!this.sessionInit) throw new Error('updateSession before connect');
     this.sessionInit = { ...this.sessionInit, ...patch };
-    this.send(buildSessionUpdate(this.sessionInit, {
+    this.send(this.buildSessionPayload());
+  }
+
+  private buildSessionPayload(): Record<string, unknown> {
+    const builder = this.config.buildSession ?? buildSessionUpdate;
+    return builder(this.sessionInit!, {
       defaultVoice: this.config.voice,
       extraSessionOptions: this.config.extraSessionOptions,
-    }));
+    });
   }
 
   override cancelResponse(): void {

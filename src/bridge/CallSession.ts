@@ -1018,7 +1018,9 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     if (this.stateValue !== 'active') return;
     this.reconnectAttempt = 0;
     this.reconnecting = false;
-    this.reinjectHistory(provider);
+    // Session resumption restored context server-side — re-injecting the
+    // transcript would duplicate it.
+    if (!provider.didResume) this.reinjectHistory(provider);
     this.flushInboundBuffer();
     this.emit('provider.reconnected');
   }

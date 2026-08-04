@@ -78,6 +78,13 @@ export abstract class BaseRealtimeProvider extends TypedEmitter<ProviderEvents> 
   cancelResponse(): void {}
   /** Trim the last assistant item to what the caller actually heard. */
   truncatePlayback(_itemId: string, _audioEndMs: number): void {}
+  /**
+   * Whether the most recent connect restored server-side context (session
+   * resumption). When true, the engine skips transcript re-injection.
+   */
+  get didResume(): boolean {
+    return false;
+  }
 }
 
 export interface ProviderFactoryContext {
