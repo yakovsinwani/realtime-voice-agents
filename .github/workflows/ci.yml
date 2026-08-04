@@ -6,6 +6,7 @@ on:
   pull_request:
 
 jobs:
+  # Runtime support: typecheck + lint + tests on every supported Node major.
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -20,7 +21,19 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run lint
-      - run: npm run build
       - run: npm test
+
+  # Build tooling (tsdown) needs Node 22+; consumers get dist, so packaging
+  # is verified once on 22.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
       - run: npx publint
       - run: npx attw --pack . --profile node16

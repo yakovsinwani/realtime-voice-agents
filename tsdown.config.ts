@@ -16,5 +16,5 @@ export default defineConfig({
   target: 'node20',
   dts: true,
   clean: true,
-  external: ['zod', 'twilio', '@google/genai', 'ws'],
+  deps: { neverBundle: ['zod', 'twilio', '@google/genai', 'ws'] },
 });
