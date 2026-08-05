@@ -394,8 +394,10 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       this.bgAudio.notifyAgentAudio();
       this.deps.transport.sendMedia(delta.base64Mulaw);
       const chunkMs = base64ByteLength(delta.base64Mulaw) / 8;
+      // Checkpoint marks only (first chunk / ~1s interval / final): per-delta
+      // marks audibly degraded Twilio playback in the field.
       const markName = this.tracker.onAudioSent(delta.responseId, chunkMs, delta.itemId);
-      this.deps.transport.sendMark(markName);
+      if (markName) this.deps.transport.sendMark(markName);
     });
 
     provider.on('responseStarted', ({ responseId }) => {
@@ -409,7 +411,10 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
     provider.on('responseDone', ({ responseId, usage }) => {
       this.generating = false;
-      this.tracker.onGenerationDone(responseId);
+      // The tail checkpoint closes the response's mark ledger; without it
+      // playback.finished (and everything gated on it) never fires.
+      const tailMark = this.tracker.onGenerationDone(responseId);
+      if (tailMark && this.deps.transport.isOpen) this.deps.transport.sendMark(tailMark);
       this.emit('agent.speech.ended', { responseId });
       if (usage) {
         const total = this.usageAccumulator.add(usage);

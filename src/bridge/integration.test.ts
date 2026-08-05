@@ -84,14 +84,43 @@ describe('bridge end-to-end (FakeTwilio ⇄ bridge ⇄ FakeOpenAI)', () => {
     });
 
     await waitFor(() => fake.sentMediaPayloads.length === 3, 2000, 'media forwarded to Twilio');
-    // Media + one mark per chunk.
-    expect(fake.outbound.filter((f) => f.event === 'mark').length).toBe(3);
+    // Checkpoint marks: one after the first chunk, one final tail once
+    // response.done lands (300ms total is under the ~1s periodic interval).
+    await waitFor(
+      () => fake.outbound.filter((f) => f.event === 'mark').length === 2,
+      2000,
+      'first + final checkpoint marks',
+    );
 
     fake.playAll();
     await waitFor(() => events.some((e) => e.startsWith('pb-finish')), 2000, 'playback finished');
     expect(events).toContain('pb-start:greet');
     expect(events).toContain('pb-finish:greet:300');
     expect(events).toContain('transcript:Hi! How can I help?');
+  });
+
+  it('interleaves checkpoint marks at ~1s intervals on long responses (not per delta)', async () => {
+    bridge = makeBridge();
+    const session = await connectCall();
+    const finishes: number[] = [];
+    session.on('playback.finished', ({ playedMs }) => finishes.push(playedMs));
+
+    // 2.5s of audio in 25 × 100ms deltas.
+    server.latest.sendAudioResponse({
+      responseId: 'long',
+      chunks: Array.from({ length: 25 }, () => mulawSilenceBase64(100)),
+    });
+    await waitFor(() => fake.sentMediaPayloads.length === 25, 2000, 'all media forwarded');
+    // first chunk (100ms) + checkpoints at 1100ms / 2100ms + final tail (2500ms).
+    await waitFor(
+      () => fake.outbound.filter((f) => f.event === 'mark').length === 4,
+      2000,
+      'checkpoint marks only',
+    );
+
+    fake.playAll();
+    await waitFor(() => finishes.length === 1, 2000, 'playback finished');
+    expect(finishes[0]).toBe(2500); // final tail keeps playedMs exact
   });
 
   it('forwards caller audio to the provider', async () => {

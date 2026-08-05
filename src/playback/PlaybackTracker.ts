@@ -1,10 +1,19 @@
 /**
  * PlaybackTracker — the honest playback clock.
  *
- * A mark is interleaved after every audio delta forwarded to Twilio. Twilio
- * plays media strictly in order and echoes each mark when playout reaches it,
- * so a mark echo is hardware-level confirmation of what the caller has heard —
- * unlike generation-time events, which run seconds ahead of the phone line.
+ * Marks are interleaved into the outbound media stream at checkpoints — after
+ * the FIRST audio chunk of a response (exact `playback.started`), then after
+ * every ~1s of accumulated audio, and after the final chunk once generation
+ * completes (exact `playback.finished`). Twilio plays media strictly in order
+ * and echoes each mark when playout reaches it, so a mark echo is
+ * hardware-level confirmation of what the caller has heard — unlike
+ * generation-time events, which run seconds ahead of the phone line.
+ *
+ * Why checkpoints and not a mark per delta: field testing showed per-delta
+ * marks (which double the message count on the Twilio socket) audibly degrade
+ * playback smoothness, while sparse marks lose nothing — between echoes,
+ * `estimatePlayedMs` interpolates with the wall clock, so truncate accuracy
+ * is bounded by echo jitter, not by the checkpoint interval.
  *
  * Clear-epoch: `clear` flushes Twilio's buffer, and Twilio echoes the
  * discarded marks immediately. Bumping the epoch before sending `clear` lets
@@ -13,6 +22,8 @@
  */
 
 export const TRACKED_MARK_PREFIX = 'tra:';
+
+const DEFAULT_CHECKPOINT_INTERVAL_MS = 1000;
 
 interface MarkRecord {
   responseId: string;
@@ -26,6 +37,8 @@ interface ResponseTrack {
   responseId: string;
   itemId?: string;
   totalMs: number;
+  /** Cumulative audio ms covered by the most recent checkpoint mark. */
+  markedMs: number;
   playedMs: number;
   sentMarks: number;
   echoedMarks: number;
@@ -52,9 +65,14 @@ export class PlaybackTracker {
   private readonly marks = new Map<string, MarkRecord>();
   private readonly responses = new Map<string, ResponseTrack>();
   private readonly now: () => number;
+  private readonly checkpointIntervalMs: number;
 
-  constructor(now: () => number = Date.now) {
+  constructor(
+    now: () => number = Date.now,
+    options: { checkpointIntervalMs?: number } = {},
+  ) {
     this.now = now;
+    this.checkpointIntervalMs = options.checkpointIntervalMs ?? DEFAULT_CHECKPOINT_INTERVAL_MS;
   }
 
   /** Is `name` one of ours (as opposed to a host-app or background mark)? */
@@ -63,36 +81,66 @@ export class PlaybackTracker {
   }
 
   /**
-   * Record an outgoing audio chunk and return the mark name to interleave
-   * after it.
+   * Record an outgoing audio chunk. Returns a mark name to interleave after
+   * it when a checkpoint is due (first chunk of the response, or
+   * checkpointIntervalMs of audio accumulated since the last mark) — null
+   * otherwise.
    */
-  onAudioSent(responseId: string, chunkMs: number, itemId?: string): string {
+  onAudioSent(responseId: string, chunkMs: number, itemId?: string): string | null {
     const track = this.ensureTrack(responseId);
     if (itemId && !track.itemId) track.itemId = itemId;
     track.totalMs += chunkMs;
-    track.sentMarks++;
-    const name = `${TRACKED_MARK_PREFIX}${++this.markSeq}`;
-    this.marks.set(name, {
-      responseId,
-      cumulativeMs: track.totalMs,
-      epoch: this.epoch,
-      isFinal: false,
-    });
-    return name;
+    const firstChunk = track.markedMs === 0 && track.sentMarks === 0;
+    const intervalDue = track.totalMs - track.markedMs >= this.checkpointIntervalMs;
+    if (!firstChunk && !intervalDue) return null;
+    return this.createMark(track, false);
   }
 
-  /** The response finished generating; its last sent mark becomes final. */
-  onGenerationDone(responseId: string): void {
+  /**
+   * The response finished generating. If audio accumulated past the last
+   * checkpoint, returns a final tail mark that MUST be sent to Twilio (it is
+   * what makes `playback.finished` fire); otherwise flags the pending mark
+   * covering the full total as final and returns null.
+   */
+  onGenerationDone(responseId: string): string | null {
     const track = this.responses.get(responseId);
-    if (!track) return;
+    if (!track) return null;
     track.generationDone = true;
+    // A response that produced no audio at all is trivially finished.
+    if (track.totalMs === 0) {
+      track.finished = true;
+      return null;
+    }
+    if (track.finished || track.flushed) return null;
+    let covered = false;
     for (const record of this.marks.values()) {
       if (record.responseId === responseId && record.cumulativeMs === track.totalMs) {
         record.isFinal = true;
+        covered = true;
       }
     }
-    // A response that produced no audio at all is trivially finished.
-    if (track.totalMs === 0) track.finished = true;
+    if (covered) return null;
+    if (track.playedMs >= track.totalMs) {
+      // The covering mark already echoed before generation-done arrived:
+      // nothing left to wait for.
+      track.finished = true;
+      this.maybeForget(track);
+      return null;
+    }
+    return this.createMark(track, true);
+  }
+
+  private createMark(track: ResponseTrack, isFinal: boolean): string {
+    track.sentMarks++;
+    track.markedMs = track.totalMs;
+    const name = `${TRACKED_MARK_PREFIX}${++this.markSeq}`;
+    this.marks.set(name, {
+      responseId: track.responseId,
+      cumulativeMs: track.totalMs,
+      epoch: this.epoch,
+      isFinal,
+    });
+    return name;
   }
 
   /** Process a mark echo from Twilio. Returns null for unknown marks. */
@@ -214,6 +262,7 @@ export class PlaybackTracker {
       track = {
         responseId,
         totalMs: 0,
+        markedMs: 0,
         playedMs: 0,
         sentMarks: 0,
         echoedMarks: 0,
