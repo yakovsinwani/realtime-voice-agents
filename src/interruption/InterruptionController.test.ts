@@ -51,6 +51,7 @@ describe('InterruptionController', () => {
     c.onResponseStarted('r1');
     c.onPlaybackStarted('r1');
     expect(c.evaluate(noTool).allow).toBe(false);
+    c.onPlaybackEnded(); // r1 finished playing — the normal turn boundary
     c.onResponseStarted('r2');
     c.onPlaybackStarted('r2');
     expect(c.evaluate(noTool).allow).toBe(true);
@@ -89,5 +90,40 @@ describe('InterruptionController', () => {
     expect(c.evaluate(noTool).allow).toBe(true);
     now += 600; // first one is now outside the window
     expect(c.evaluate(noTool).allow).toBe(true);
+  });
+
+  it('a response starting while the guarded one still plays does not steal the guard', () => {
+    let now = 0;
+    const c = new InterruptionController(
+      { guardDurationMs: 60_000, firstResponseOnly: true },
+      () => now,
+    );
+    c.onResponseStarted('r1');
+    c.onPlaybackStarted('r1');
+    now += 500;
+    expect(c.evaluate(noTool)).toEqual({ allow: false, cause: 'guard' });
+
+    // The server auto-answers a blocked turn mid-playback (its generation of
+    // r1 finished long before the caller heard it all).
+    c.onResponseStarted('phantom');
+    now += 500;
+    expect(c.evaluate(noTool)).toEqual({ allow: false, cause: 'guard' }); // still guarded
+
+    // Guarded playback ends: the deferred rotation applies, firstResponseOnly
+    // is spent, and later responses are freely interruptible.
+    c.onPlaybackEnded();
+    c.onResponseStarted('r3');
+    c.onPlaybackStarted('r3');
+    expect(c.evaluate(noTool).allow).toBe(true);
+  });
+
+  it('a guarded response that produces no audio releases the hold on settle', () => {
+    const c = new InterruptionController({ guardDurationMs: 60_000 }, () => 0);
+    c.onResponseStarted('r1');
+    c.onPlaybackEnded(); // CallSession settles a no-audio response this way
+    c.onResponseStarted('r2');
+    c.onPlaybackStarted('r2');
+    // r2 owns the guard — rotation was not left stuck on the silent r1.
+    expect(c.evaluate(noTool)).toEqual({ allow: false, cause: 'guard' });
   });
 });

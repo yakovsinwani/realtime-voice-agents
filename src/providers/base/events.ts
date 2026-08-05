@@ -37,7 +37,8 @@ export interface ProviderCloseInfo {
   retriable: boolean;
 }
 
-export interface ProviderEvents extends Record<string, (...args: any[]) => void> {
+// No `extends Record<string, ...>` — see SessionEventMap for why.
+export interface ProviderEvents {
   open: () => void;
   close: (info: ProviderCloseInfo) => void;
   error: (error: Error) => void;

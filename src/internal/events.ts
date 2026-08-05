@@ -5,8 +5,14 @@ type Listener = (...args: any[]) => void;
 /**
  * EventEmitter with a typed event map. Listener errors are contained per
  * Node's usual semantics; `emit` returns whether any listener ran.
+ *
+ * The constraint deliberately avoids `Record<string, Listener>`: event-map
+ * interfaces must NOT carry a string index signature, or `keyof` widens to
+ * `string` and misspelled event names compile silently (a listener that can
+ * never fire). With the mapped-type constraint, plain interfaces qualify and
+ * unknown names are compile-time errors.
  */
-export class TypedEmitter<Events extends Record<string, Listener>> {
+export class TypedEmitter<Events extends { [K in keyof Events]: Listener }> {
   private readonly emitter = new EventEmitter();
 
   constructor() {

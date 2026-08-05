@@ -34,7 +34,9 @@ export interface ApprovalRequestInfo {
   expiresAtMs: number;
 }
 
-export interface SessionEventMap extends Record<string, (...args: any[]) => void> {
+// No `extends Record<string, ...>` here: an index signature would widen
+// `keyof` to `string` and let misspelled event names compile silently.
+export interface SessionEventMap {
   'call.started': (info: CallStartedInfo) => void;
   'call.ended': (info: { reason: CallEndReason; durationMs: number; usage: UsageInfo }) => void;
   'call.failed': (error: Error) => void;
@@ -77,7 +79,7 @@ export interface SessionEventMap extends Record<string, (...args: any[]) => void
   error: (error: Error) => void;
 }
 
-export interface BridgeEventMap extends Record<string, (...args: any[]) => void> {
+export interface BridgeEventMap {
   'session.started': (session: CallSession) => void;
   'session.ended': (info: { callSid: string; reason: CallEndReason }) => void;
   'connection.rejected': (info: { reason: string }) => void;

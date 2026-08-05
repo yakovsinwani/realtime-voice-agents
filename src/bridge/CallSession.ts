@@ -446,6 +446,9 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       }
       // A response with no audio produces no marks — settle dependents now.
       if (!this.tracker.isPlaybackActive()) {
+        // Nothing is (or will be) playing: release the guard's playback hold
+        // so deferred guard rotations apply (see InterruptionController).
+        this.interruptions.onPlaybackEnded();
         this.flushToolQueue();
         void this.executePendingTransfer();
         this.maybeCompleteHangup();
@@ -615,6 +618,9 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
   private performInterrupt(): void {
     const active = this.tracker.snapshotActive();
     this.tracker.onClear();
+    // The flush ends whatever was playing — release the guard's playback
+    // hold so deferred guard rotations apply to the responses that follow.
+    this.interruptions.onPlaybackEnded();
     if (this.deps.transport.isOpen) this.deps.transport.sendClear();
     for (const response of active) {
       this.interruptedResponses.add(response.responseId);

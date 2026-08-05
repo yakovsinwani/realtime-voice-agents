@@ -161,6 +161,28 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
         reject(error);
       };
 
+      // A non-101 upgrade (401 bad key, 403 no credits, 404 bad path) would
+      // otherwise surface as a bare 1006 close with no cause — capture the
+      // provider's actual verdict, body included.
+      ws.on('unexpected-response', (_request, response) => {
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk: string) => {
+          if (body.length < 512) body += chunk;
+        });
+        response.on('end', () => {
+          const detail = body.trim().slice(0, 500);
+          this.logger.error('provider rejected the WebSocket upgrade', {
+            status: response.statusCode,
+            body: detail,
+          });
+          fail(
+            new Error(
+              `${this.name} rejected the WebSocket upgrade: HTTP ${response.statusCode}${detail ? ` — ${detail}` : ''}`,
+            ),
+          );
+        });
+      });
       ws.on('open', () => this.emit('open'));
       ws.on('message', (raw) => {
         const event = this.parseEvent(raw);

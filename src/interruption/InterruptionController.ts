@@ -54,6 +54,10 @@ export class InterruptionController {
   private responseIndex = 0;
   private guardStartedAt: number | null = null;
   private guardResponseId: string | null = null;
+  /** The guarded response's audio has not finished (or been flushed) yet. */
+  private guardPlaybackOpen = false;
+  /** Responses that began while the guarded one was still playing. */
+  private deferredStarts = 0;
   private firstSentenceDone = true;
   private transcriptBuffer = '';
   private suspended = false;
@@ -70,9 +74,21 @@ export class InterruptionController {
 
   /** A new response started generating: reset first-sentence tracking. */
   onResponseStarted(responseId: string): void {
-    this.responseIndex++;
+    // A response that begins while the guarded response is still audibly
+    // playing (e.g. the server auto-answering a guard-blocked caller turn —
+    // generation finishes long before playback) must not steal the guard:
+    // the caller is still listening to the protected audio, and with
+    // firstResponseOnly the index bump would disarm the guard mid-greeting
+    // (field bug, Aug 2026). Rotation is deferred until playback ends.
+    if (this.guardPlaybackOpen && this.guardActive()) {
+      this.deferredStarts++;
+      return;
+    }
+    this.responseIndex += 1 + this.deferredStarts;
+    this.deferredStarts = 0;
     this.guardResponseId = responseId;
     this.guardStartedAt = null;
+    this.guardPlaybackOpen = true;
     this.transcriptBuffer = '';
     this.firstSentenceDone = !this.settings.preventInterruptionOnFirstSentence;
   }
@@ -92,6 +108,12 @@ export class InterruptionController {
   /** Current playback finished or was cleared: cooldown suspension ends. */
   onPlaybackEnded(): void {
     this.suspended = false;
+    this.guardPlaybackOpen = false;
+    // Apply rotations deferred while the guarded audio was still playing.
+    if (this.deferredStarts > 0) {
+      this.responseIndex += this.deferredStarts;
+      this.deferredStarts = 0;
+    }
   }
 
   /**

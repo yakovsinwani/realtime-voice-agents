@@ -248,6 +248,44 @@ describe('bridge end-to-end (FakeTwilio ⇄ bridge ⇄ FakeOpenAI)', () => {
     await server.latest.waitForEvent('response.create');
   });
 
+  it('a server auto-response to a blocked turn does not disarm the first-response guard', async () => {
+    bridge = makeBridge({
+      session: {
+        greeting: { mode: 'user-initiates' },
+        interruptions: { enabled: true, guardDurationMs: 60_000, firstResponseOnly: true },
+      },
+    });
+    const session = await connectCall();
+    const blocked: string[] = [];
+    session.on('interruption.blocked', ({ cause }) => blocked.push(cause));
+
+    // The guarded response streams and starts playing.
+    server.latest.sendAudioResponse({
+      responseId: 'protected',
+      chunks: [mulawSilenceBase64(400), mulawSilenceBase64(400)],
+    });
+    await waitFor(() => fake.sentMediaPayloads.length === 2, 2000, 'audio at Twilio');
+    fake.advancePlayback(400); // first checkpoint echoes → guard clock starts
+
+    // Caller mumbles: blocked. Their committed turn gets auto-answered by the
+    // server while the protected audio is still playing.
+    server.latest.sendSpeechStarted();
+    await waitFor(() => blocked.length === 1, 2000, 'first block');
+    server.latest.sendSpeechStopped();
+    server.latest.sendAudioResponse({
+      responseId: 'phantom',
+      chunks: [mulawSilenceBase64(200)],
+    });
+    await waitFor(() => fake.sentMediaPayloads.length === 3, 2000, 'phantom audio queued');
+
+    // Caller talks again mid-protected-playback: the phantom's responseStarted
+    // must NOT have burned the firstResponseOnly guard.
+    server.latest.sendSpeechStarted();
+    await waitFor(() => blocked.length === 2, 2000, 'second block');
+    expect(blocked).toEqual(['guard', 'guard']);
+    expect(fake.clearCount).toBe(0);
+  });
+
   it('fallback providers (no vadInterruptControl): barge-in clears but never sends response.cancel', async () => {
     bridge = makeBridge({
       provider: ({ logger }) =>

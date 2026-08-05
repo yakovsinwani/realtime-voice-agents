@@ -223,6 +223,33 @@ describe('OpenAICompatibleProvider against FakeOpenAIServer', () => {
     expect(errors).toHaveLength(0);
   });
 
+  it('surfaces an HTTP upgrade rejection with its status and body', async () => {
+    const { createServer } = await import('node:http');
+    const rejecting = createServer();
+    rejecting.on('upgrade', (_request, socket) => {
+      const body = '{"error":"Your newly created team doesn\'t have any credits yet."}';
+      socket.end(
+        'HTTP/1.1 403 Forbidden\r\n' +
+          'Content-Type: application/json\r\n' +
+          `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+          'Connection: close\r\n' +
+          '\r\n' +
+          body,
+      );
+    });
+    await new Promise<void>((resolve) => rejecting.listen(0, '127.0.0.1', resolve));
+    const { port } = rejecting.address() as { port: number };
+    const failing = new OpenAICompatibleProvider({
+      apiKey: 'k',
+      model: 'gpt-realtime',
+      baseUrl: `ws://127.0.0.1:${port}`,
+      connectTimeoutMs: 1000,
+    });
+    await expect(failing.connect(INIT)).rejects.toThrow(/HTTP 403.*credits/);
+    await failing.close();
+    await new Promise<void>((resolve) => rejecting.close(() => resolve()));
+  });
+
   it("ignores xAI's cancel-race shape (generic code, telltale message)", async () => {
     await provider.connect(INIT);
     const errors: Error[] = [];
