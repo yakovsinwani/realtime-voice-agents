@@ -1,5 +1,17 @@
 # twilio-realtime-agents
 
+## 1.1.3
+
+### Patch Changes
+
+- 3dd1185: Three hardening fixes from field testing:
+
+  - HTTP-rejected WebSocket upgrades (401 bad key, 403 no credits, 404 bad path) now fail the connect with the provider's actual status and response body instead of a bare close code 1006 — xAI's "team has no credits" verdict was previously invisible.
+  - Event maps no longer carry a string index signature, so a misspelled event name (`session.on("tool.succeeded", ...)` — the real event is `tool.completed`) is now a compile-time error instead of a listener that silently never fires. If your build breaks on an event name after upgrading, the listener was never firing to begin with.
+  - The interruption guard is no longer disarmed by a response that starts while the guarded response's audio is still playing (the server auto-answers a guard-blocked caller turn as soon as generation — not playback — finishes; with `firstResponseOnly` that phantom response burned the guard mid-greeting). Guard rotation now defers until the guarded playback actually ends.
+
+- 9ce2a9f: Gemini Live setup failures no longer crash the host process. When the server refuses a session during setup (e.g. close 1007 for an unsupported config), both the SDK's connect promise and the provider's internal setup promise reject; the rejection `connect()` did not rethrow escaped as a process-killing unhandledRejection. Both rejections are now always observed, and `connect()` surfaces the server's close code and reason instead of the SDK's generic connect failure.
+
 ## 1.1.2
 
 ### Patch Changes
