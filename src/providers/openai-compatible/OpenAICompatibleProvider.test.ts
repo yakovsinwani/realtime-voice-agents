@@ -223,6 +223,20 @@ describe('OpenAICompatibleProvider against FakeOpenAIServer', () => {
     expect(errors).toHaveLength(0);
   });
 
+  it("ignores xAI's cancel-race shape (generic code, telltale message)", async () => {
+    await provider.connect(INIT);
+    const errors: Error[] = [];
+    provider.on('error', (error) => errors.push(error));
+    // xAI reports the same benign race without the dedicated OpenAI code.
+    server.latest.sendError({
+      type: 'invalid_request_error',
+      code: 'invalid_request_error',
+      message: 'Cancellation failed: no active response found',
+    });
+    await delay(50);
+    expect(errors).toHaveLength(0);
+  });
+
   it('rejects connect when the server closes with a policy code during setup', async () => {
     const strict = await FakeOpenAIServer.start({ autoAckSessionUpdate: false });
     const failing = new OpenAICompatibleProvider({

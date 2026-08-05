@@ -594,8 +594,11 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     }
     // Bridge-owned interruption: we cancel generation ourselves (server-side
     // auto-interrupt is disabled where the provider supports it), then kill
-    // playback. On fallback providers the cancel is a benign no-op race.
-    if (this.generating) this.provider?.cancelResponse();
+    // playback. Fallback providers' servers already cancelled on speech
+    // onset — an extra cancel from us would just race and error.
+    if (this.generating && this.provider?.capabilities.vadInterruptControl) {
+      this.provider.cancelResponse();
+    }
     this.performInterrupt();
   }
 
@@ -619,6 +622,10 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     }
     // Anything queued behind the flushed audio can go out now.
     this.flushToolQueue();
+    // A barge-in that flushed the goodbye means the caller talked over the
+    // farewell — its playout will never confirm; complete now instead of
+    // burning the hangup watchdog on dead air.
+    if (this.pendingHangup?.sawResponse) this.completeHangup();
   }
 
   // ---- tools ---------------------------------------------------------------

@@ -419,10 +419,18 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
           });
           break;
         }
-        if (code === 'response_cancel_not_active') {
-          // Cancel raced response.done — nothing left to interrupt.
-          this.logger.warn('response.cancel raced completion (ignored)', { error: event.error });
-          break;
+        {
+          const message = typeof event.error?.message === 'string' ? event.error.message : '';
+          if (
+            code === 'response_cancel_not_active' ||
+            // xAI reports the same benign race as a generic invalid_request_error.
+            /cancellation failed: no active response/i.test(message)
+          ) {
+            // Cancel raced response.done / the server's own VAD cancel —
+            // nothing left to interrupt.
+            this.logger.warn('response.cancel raced completion (ignored)', { error: event.error });
+            break;
+          }
         }
         this.logger.warn('provider error event', { error: event.error });
         this.emit('error', new Error(`${this.name} error: ${JSON.stringify(event.error ?? event)}`));

@@ -248,6 +248,37 @@ describe('bridge end-to-end (FakeTwilio ⇄ bridge ⇄ FakeOpenAI)', () => {
     await server.latest.waitForEvent('response.create');
   });
 
+  it('fallback providers (no vadInterruptControl): barge-in clears but never sends response.cancel', async () => {
+    bridge = makeBridge({
+      provider: ({ logger }) =>
+        new OpenAICompatibleProvider(
+          {
+            apiKey: 'test',
+            model: 'grok-voice-latest',
+            baseUrl: server.url,
+            capabilityOverrides: { vadInterruptControl: false },
+          },
+          logger,
+        ),
+    });
+    await connectCall();
+
+    // Generation still in flight when the caller talks — on these providers
+    // the SERVER already cancelled; the bridge must not race it.
+    server.latest.sendAudioResponse({
+      responseId: 'gen',
+      itemId: 'item_gen',
+      chunks: [mulawSilenceBase64(200), mulawSilenceBase64(200)],
+      complete: false,
+    });
+    await waitFor(() => fake.sentMediaPayloads.length === 2, 2000, 'audio at Twilio');
+    fake.advancePlayback(200);
+    server.latest.sendSpeechStarted();
+
+    await waitFor(() => fake.clearCount === 1, 2000, 'clear frame');
+    expect(server.latest.eventsOfType('response.cancel').length).toBe(0);
+  });
+
   it('runs a sync tool and returns the result to the model', async () => {
     const lookup = tool({
       name: 'lookup_order',
@@ -406,6 +437,28 @@ describe('bridge end-to-end (FakeTwilio ⇄ bridge ⇄ FakeOpenAI)', () => {
     await waitFor(() => session.state === 'ended', 3000, 'session ended');
     expect(endedReason).toBe('agent-hangup');
     expect(fake.wasClosedByBridge).toBe(true);
+  });
+
+  it('caller talking over the goodbye completes the hangup immediately (no watchdog wait)', async () => {
+    bridge = makeBridge({ builtinTools: { finishCall: true } });
+    const session = await connectCall();
+    let endedReason = '';
+    session.on('call.ended', ({ reason }) => (endedReason = reason));
+
+    server.latest.sendToolCall({ name: 'finish_call', argumentsJson: '{"reason":"done"}' });
+    await server.latest.waitForEvent(
+      (f) => f.type === 'conversation.item.create' && f.item?.type === 'function_call_output',
+    );
+    server.latest.sendAudioResponse({ responseId: 'bye', chunks: [mulawSilenceBase64(400)] });
+    await waitFor(() => fake.queuedMs > 0, 2000, 'goodbye audio at Twilio');
+
+    // Caller hears a bit of the goodbye, then talks over it: the flushed
+    // farewell will never confirm — the hangup must complete now, well
+    // before the 7s watchdog.
+    fake.advancePlayback(100);
+    server.latest.sendSpeechStarted();
+    await waitFor(() => session.state === 'ended', 2000, 'immediate hangup');
+    expect(endedReason).toBe('agent-hangup');
   });
 
   it('hangup watchdog fires when the final mark echo never arrives', async () => {
