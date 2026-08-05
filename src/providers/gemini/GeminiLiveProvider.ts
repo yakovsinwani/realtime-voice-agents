@@ -136,11 +136,23 @@ export class GeminiLiveProvider extends BaseRealtimeProvider {
     if (init.freshSession) this.resumptionHandle = null;
 
     let setupResolve!: () => void;
-    let setupReject!: (error: Error) => void;
+    let rejectSetup!: (error: Error) => void;
     const setupDone = new Promise<void>((resolve, reject) => {
       setupResolve = resolve;
-      setupReject = reject;
+      rejectSetup = reject;
     });
+    // A setup failure produces TWO rejections — the SDK's connect promise and
+    // setupDone (via onclose/onerror). Only one is awaited below; observe
+    // setupDone unconditionally so the losing rejection can never escape as a
+    // process-killing unhandledRejection, and keep the first setup error so
+    // the connector path can surface the server's close reason instead of the
+    // SDK's generic failure.
+    let setupError: Error | null = null;
+    setupDone.catch(() => {});
+    const setupReject = (error: Error) => {
+      setupError ??= error;
+      rejectSetup(error);
+    };
     const timeoutMs = this.config.connectTimeoutMs ?? 10_000;
     const timer = setTimeout(
       () => setupReject(new Error(`gemini setup not complete within ${timeoutMs}ms`)),
@@ -149,41 +161,45 @@ export class GeminiLiveProvider extends BaseRealtimeProvider {
     timer.unref?.();
 
     try {
-      this.session = await connector({
-        model: this.config.model,
-        config: this.buildConfig(init, handle),
-        callbacks: {
-          onopen: () => this.emit('open'),
-          onmessage: (message) => {
-            if (message?.setupComplete !== undefined) {
-              this.ready = true;
-              if (handle) this.resumed = true;
-              setupResolve();
-              return;
-            }
-            this.handleMessage(message);
+      try {
+        this.session = await connector({
+          model: this.config.model,
+          config: this.buildConfig(init, handle),
+          callbacks: {
+            onopen: () => this.emit('open'),
+            onmessage: (message) => {
+              if (message?.setupComplete !== undefined) {
+                this.ready = true;
+                if (handle) this.resumed = true;
+                setupResolve();
+                return;
+              }
+              this.handleMessage(message);
+            },
+            onerror: (error) => {
+              const err = error instanceof Error ? error : new Error(String(error?.message ?? error));
+              if (!this.ready) setupReject(err);
+              else this.emit('error', err);
+            },
+            onclose: (event) => {
+              const wasReady = this.ready;
+              this.ready = false;
+              this.session = null;
+              if (!wasReady) {
+                setupReject(new Error(`gemini closed during setup (${event?.code} ${event?.reason ?? ''})`));
+                return;
+              }
+              this.emit('close', {
+                code: event?.code,
+                reason: event?.reason,
+                retriable: !this.intentionalClose && !isNonRetriableClose(event?.code),
+              });
+            },
           },
-          onerror: (error) => {
-            const err = error instanceof Error ? error : new Error(String(error?.message ?? error));
-            if (!this.ready) setupReject(err);
-            else this.emit('error', err);
-          },
-          onclose: (event) => {
-            const wasReady = this.ready;
-            this.ready = false;
-            this.session = null;
-            if (!wasReady) {
-              setupReject(new Error(`gemini closed during setup (${event?.code} ${event?.reason ?? ''})`));
-              return;
-            }
-            this.emit('close', {
-              code: event?.code,
-              reason: event?.reason,
-              retriable: !this.intentionalClose && !isNonRetriableClose(event?.code),
-            });
-          },
-        },
-      });
+        });
+      } catch (error) {
+        throw setupError ?? (error instanceof Error ? error : new Error(String(error)));
+      }
       await setupDone;
     } finally {
       clearTimeout(timer);

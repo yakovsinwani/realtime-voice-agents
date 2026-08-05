@@ -166,4 +166,34 @@ describe('GeminiLiveProvider', () => {
       disabled: true,
     });
   });
+
+  it('surfaces the close reason when the connector rejects while onclose fires during setup', async () => {
+    // A server that refuses the session mid-setup (e.g. close 1007 for an
+    // unsupported config) produces TWO rejections: the SDK's connect promise
+    // and the internal setupDone promise. The one connect() does not throw
+    // must still be observed, or it escapes as a process-killing
+    // unhandledRejection on the host.
+    const rejections: unknown[] = [];
+    const onUnhandled = (reason: unknown) => void rejections.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const racing = new GeminiLiveProvider({
+        model: 'gemini-test',
+        voice: 'Aoede',
+        connector: async ({ callbacks }) => {
+          callbacks.onclose?.({ code: 1007, reason: 'Unsupported language code' });
+          throw new Error('generic sdk connect failure');
+        },
+      });
+      await expect(racing.connect(INIT)).rejects.toThrow(
+        'gemini closed during setup (1007 Unsupported language code)',
+      );
+      // unhandledRejection fires after the current macrotask; drain two turns.
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(rejections).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
 });
