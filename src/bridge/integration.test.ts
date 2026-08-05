@@ -474,6 +474,82 @@ describe('bridge end-to-end (FakeTwilio ⇄ bridge ⇄ FakeOpenAI)', () => {
     await waitFor(() => session.state === 'ended', 3000, 'watchdog teardown');
   });
 
+  it('goodbye playing longer than markTimeoutMs is not truncated (echoes re-arm the watchdog)', async () => {
+    bridge = makeBridge({
+      builtinTools: { finishCall: true },
+      session: { hangup: { markTimeoutMs: 400 } },
+    });
+    const session = await connectCall();
+    let endedReason = '';
+    session.on('call.ended', ({ reason }) => (endedReason = reason));
+    let finishedMs = 0;
+    session.on('playback.finished', (e) => (finishedMs = e.playedMs));
+
+    server.latest.sendToolCall({ name: 'finish_call', argumentsJson: '{"reason":"done"}' });
+    await server.latest.waitForEvent(
+      (f) => f.type === 'conversation.item.create' && f.item?.type === 'function_call_output',
+    );
+    // A 5s goodbye in 500ms deltas — checkpoint marks land roughly every
+    // second of audio, so playout keeps echoing proof of life.
+    server.latest.sendAudioResponse({
+      responseId: 'bye',
+      chunks: Array.from({ length: 10 }, () => mulawSilenceBase64(500)),
+      transcript: 'A long goodbye',
+    });
+    await waitFor(() => fake.queuedMs >= 5000, 2000, 'goodbye audio at Twilio');
+
+    // Play out gradually across ~1.25s of wall clock — several times the
+    // 400ms window. Each step echoes checkpoint marks; the pre-fix one-shot
+    // watchdog would have force-hung-up mid-goodbye at +400ms.
+    for (let step = 0; step < 5; step++) {
+      expect(session.state).not.toBe('ended');
+      fake.advancePlayback(1000);
+      await delay(250);
+    }
+    await waitFor(() => session.state === 'ended', 2000, 'hangup after full playout');
+    expect(endedReason).toBe('agent-hangup');
+    expect(finishedMs).toBe(5000); // the goodbye played to the last millisecond
+  });
+
+  it('goodbye still generating when the window elapses is given more time (deltas re-arm)', async () => {
+    bridge = makeBridge({
+      builtinTools: { finishCall: true },
+      session: { hangup: { markTimeoutMs: 250 } },
+    });
+    const session = await connectCall();
+    let endedReason = '';
+    session.on('call.ended', ({ reason }) => (endedReason = reason));
+
+    server.latest.sendToolCall({ name: 'finish_call', argumentsJson: '{}' });
+    await server.latest.waitForEvent(
+      (f) => f.type === 'conversation.item.create' && f.item?.type === 'function_call_output',
+    );
+    // The model trickles the goodbye out over ~1.2s of wall clock — ~5 quiet
+    // windows' worth — without any playout yet. Each delta is evidence.
+    server.latest.send({ type: 'response.created', response: { id: 'bye' } });
+    server.latest.send({
+      type: 'response.output_item.added',
+      response_id: 'bye',
+      item: { id: 'item_bye', type: 'message' },
+    });
+    for (let i = 0; i < 8; i++) {
+      expect(session.state).not.toBe('ended');
+      server.latest.send({
+        type: 'response.output_audio.delta',
+        response_id: 'bye',
+        item_id: 'item_bye',
+        delta: mulawSilenceBase64(100),
+      });
+      await delay(150);
+    }
+    server.latest.send({ type: 'response.done', response: { id: 'bye', status: 'completed' } });
+
+    await waitFor(() => fake.queuedMs >= 800, 2000, 'full goodbye at Twilio');
+    fake.playAll();
+    await waitFor(() => session.state === 'ended', 2000, 'hangup after playout');
+    expect(endedReason).toBe('agent-hangup');
+  });
+
   it('tears down on caller hangup (stop frame)', async () => {
     bridge = makeBridge();
     const session = await connectCall();

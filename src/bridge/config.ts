@@ -50,8 +50,12 @@ export interface IdleOptions {
 
 export interface HangupOptions {
   /**
-   * Watchdog: if Twilio's final mark echo never arrives (dead socket), force
-   * completion after this long. Default 7000.
+   * Watchdog window: force hangup completion only after the pending goodbye
+   * shows no progress — no audio deltas, no response start, no mark echoes —
+   * for this long. Evidence re-arms the window, so a goodbye that is still
+   * being generated or played is never cut off, on any provider; a dead
+   * socket or a model that never says goodbye completes within one or two
+   * quiet windows. Default 7000.
    */
   markTimeoutMs: number;
 }

@@ -104,6 +104,10 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     watchdog: NodeJS.Timeout;
     /** A goodbye response began after arming — completion may proceed once idle. */
     sawResponse: boolean;
+    /** Monotonic goodbye-liveness evidence: deltas sent, response starts, mark echoes. */
+    progress: number;
+    /** `progress` at the last watchdog check — no movement for a window = dead leg. */
+    progressAtCheck: number;
   } | null = null;
   private pendingTransfer: { phoneNumber: string; callerId?: string } | null = null;
   private endedReason: CallEndReason | null = null;
@@ -409,6 +413,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       // clearing would flush this very delta out of Twilio's buffer).
       this.bgAudio.notifyAgentAudio();
       this.deps.transport.sendMedia(delta.base64Mulaw);
+      this.noteHangupProgress(); // goodbye audio still flowing — not a dead leg
       const chunkMs = base64ByteLength(delta.base64Mulaw) / 8;
       // Checkpoint marks only (first chunk / ~1s interval / final): per-delta
       // marks audibly degraded Twilio playback in the field.
@@ -422,6 +427,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       this.blockedUserTurn = 'idle'; // something is answering the caller
 
       if (this.pendingHangup) this.pendingHangup.sawResponse = true;
+      this.noteHangupProgress(); // the goodbye began — give it a fresh window
       this.clearIdleTimer();
       this.interruptions.onResponseStarted(responseId);
       this.emit('agent.speech.started', { responseId });
@@ -544,7 +550,11 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     }
     if (!PlaybackTracker.isTrackedMark(name)) return;
     const result = this.tracker.onMarkEcho(name);
-    if (!result || result.kind === 'flushed') return;
+    if (!result) return;
+    // Any tracked echo proves the Twilio leg is alive and playing out
+    // (background-audio marks are already filtered by isTrackedMark).
+    this.noteHangupProgress();
+    if (result.kind === 'flushed') return;
     if (result.playbackStarted) {
       this.emit('playback.started', { responseId: result.responseId });
       this.interruptions.onPlaybackStarted(result.responseId);
@@ -1066,14 +1076,44 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     if (this.pendingHangup) {
       return new Promise((resolve) => this.pendingHangup!.resolvers.push(resolve));
     }
-    const watchdog = setTimeout(() => {
-      this.log.warn('hangup watchdog fired — goodbye playout never confirmed');
+    this.pendingHangup = {
+      resolvers: [],
+      watchdog: this.armHangupWatchdog(),
+      sawResponse: false,
+      progress: 0,
+      progressAtCheck: 0,
+    };
+    return new Promise((resolve) => this.pendingHangup!.resolvers.push(resolve));
+  }
+
+  /** Evidence the goodbye is alive (generating or playing) — feeds the watchdog. */
+  private noteHangupProgress(): void {
+    if (this.pendingHangup) this.pendingHangup.progress++;
+  }
+
+  /**
+   * Watchdog: forces completion only after a full quiet window — no deltas, no
+   * response start, no mark echoes for `markTimeoutMs`. Evidence re-arms it, so
+   * a slow or long goodbye is NEVER truncated mid-playout (wall-clock must not
+   * override live mark evidence); a dead socket or a model that never says
+   * goodbye still completes within one or two quiet windows.
+   */
+  private armHangupWatchdog(): NodeJS.Timeout {
+    const timer = setTimeout(() => {
+      this.timers.delete(timer);
+      const pending = this.pendingHangup;
+      if (!pending) return;
+      if (pending.progress !== pending.progressAtCheck) {
+        pending.progressAtCheck = pending.progress;
+        pending.watchdog = this.armHangupWatchdog();
+        return;
+      }
+      this.log.warn('hangup watchdog fired — no goodbye progress for a full window');
       this.completeHangup();
     }, this.deps.options.hangup.markTimeoutMs);
-    watchdog.unref?.();
-    this.timers.add(watchdog);
-    this.pendingHangup = { resolvers: [], watchdog, sawResponse: false };
-    return new Promise((resolve) => this.pendingHangup!.resolvers.push(resolve));
+    timer.unref?.();
+    this.timers.add(timer);
+    return timer;
   }
 
   private maybeCompleteHangup(): void {
