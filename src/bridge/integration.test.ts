@@ -173,6 +173,81 @@ describe('bridge end-to-end (FakeTwilio ⇄ bridge ⇄ FakeOpenAI)', () => {
     expect(fake.clearCount).toBe(0);
   });
 
+  it('allowed barge-in mid-generation: bridge sends response.cancel and drops straggler deltas', async () => {
+    bridge = makeBridge();
+    const session = await connectCall();
+    const ended: string[] = [];
+    session.on('agent.speech.ended', ({ responseId }) => ended.push(responseId));
+
+    // Generation still in flight (no response.done yet) when the caller talks.
+    server.latest.sendAudioResponse({
+      responseId: 'gen',
+      itemId: 'item_gen',
+      chunks: [mulawSilenceBase64(200), mulawSilenceBase64(200)],
+      complete: false,
+    });
+    await waitFor(() => fake.sentMediaPayloads.length === 2, 2000, 'audio at Twilio');
+    fake.advancePlayback(200);
+    server.latest.sendSpeechStarted();
+
+    await waitFor(() => fake.clearCount === 1, 2000, 'clear frame');
+    // The server no longer auto-cancels (interrupt_response: false) — the
+    // bridge must do it itself.
+    await server.latest.waitForEvent('response.cancel');
+    await server.latest.waitForEvent('conversation.item.truncate');
+
+    // A delta already in flight when we cancelled must not reach Twilio —
+    // it would queue stale speech behind the clear.
+    server.latest.send({
+      type: 'response.output_audio.delta',
+      response_id: 'gen',
+      item_id: 'item_gen',
+      delta: mulawSilenceBase64(200),
+    });
+    server.latest.send({ type: 'response.done', response: { id: 'gen', status: 'cancelled' } });
+    await waitFor(() => ended.length === 1, 2000, 'response settled');
+    expect(fake.sentMediaPayloads.length).toBe(2);
+  });
+
+  it('blocked barge-in: agent keeps talking, and the swallowed caller turn is answered after playback', async () => {
+    bridge = makeBridge({
+      session: {
+        greeting: { mode: 'user-initiates' }, // keep response.create traffic to the continuity one
+        interruptions: { enabled: true, guardDurationMs: 60_000 },
+      },
+    });
+    const session = await connectCall();
+    const blocked: string[] = [];
+    session.on('interruption.blocked', ({ cause }) => blocked.push(cause));
+
+    server.latest.sendAudioResponse({
+      responseId: 'protected',
+      chunks: [mulawSilenceBase64(300), mulawSilenceBase64(300)],
+      complete: false,
+    });
+    await waitFor(() => fake.sentMediaPayloads.length === 2, 2000, 'audio at Twilio');
+    fake.advancePlayback(100);
+
+    // Caller talks through the guard: nothing is cancelled, nothing cleared.
+    server.latest.sendSpeechStarted();
+    await waitFor(() => blocked.length === 1, 2000, 'blocked event');
+    server.latest.sendSpeechStopped();
+    expect(fake.clearCount).toBe(0);
+    expect(server.latest.eventsOfType('response.cancel').length).toBe(0);
+
+    server.latest.send({ type: 'response.done', response: { id: 'protected', status: 'completed' } });
+    await waitFor(
+      () => fake.outbound.filter((f) => f.event === 'mark').length === 2,
+      2000,
+      'first + tail checkpoint marks',
+    );
+    expect(fake.sentMediaPayloads.length).toBe(2); // agent audio flowed untouched
+
+    // Protected playback completes → the bridge answers the swallowed turn.
+    fake.playAll();
+    await server.latest.waitForEvent('response.create');
+  });
+
   it('runs a sync tool and returns the result to the model', async () => {
     const lookup = tool({
       name: 'lookup_order',

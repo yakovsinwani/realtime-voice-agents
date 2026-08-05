@@ -86,6 +86,14 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
   private generating = false;
   private currentResponseId: string | null = null;
   private firstTurnDone = false;
+  /**
+   * A caller turn that a blocked barge-in swallowed. With bridge-owned
+   * interruptions the server no longer auto-responds while the protected
+   * response is active, so the bridge answers it after protected playback:
+   * 'speaking' → user started during a block; 'committed' → their turn ended
+   * (VAD committed it) and deserves a response once playback finishes.
+   */
+  private blockedUserTurn: 'idle' | 'speaking' | 'committed' = 'idle';
   private greeted = false;
   private answered: boolean;
   private inboundBuffer: string[] = [];
@@ -351,6 +359,10 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
           : ''),
       voice: this.activeAgentValue.voice,
       vad: this.deps.options.vad,
+      // The guard must be able to VETO an interruption, which requires the
+      // server not to auto-cancel on speech onset. Capability-gated inside
+      // each provider; explicit vad.interruptResponse wins.
+      bridgeOwnsInterruptions: true,
       tools: [...this.toolset.values()].map((tool) => {
         const decorated = decorateTool(tool, this.middlewares);
         return {
@@ -389,6 +401,10 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     provider.on('audio', (delta) => {
       if (this.stateValue !== 'active' && this.stateValue !== 'ending') return;
       if (!this.deps.transport.isOpen) return;
+      // With bridge-owned cancels, deltas already in flight when we cancelled
+      // keep arriving for a round-trip — forwarding them would queue stale
+      // speech behind the clear we just sent.
+      if (this.interruptedResponses.has(delta.responseId)) return;
       // Real agent speech preempts any hold loop instantly (no fade, no clear:
       // clearing would flush this very delta out of Twilio's buffer).
       this.bgAudio.notifyAgentAudio();
@@ -403,6 +419,8 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     provider.on('responseStarted', ({ responseId }) => {
       this.generating = true;
       this.currentResponseId = responseId;
+      this.blockedUserTurn = 'idle'; // something is answering the caller
+
       if (this.pendingHangup) this.pendingHangup.sawResponse = true;
       this.clearIdleTimer();
       this.interruptions.onResponseStarted(responseId);
@@ -461,7 +479,12 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       this.emit('user.speech.started');
       this.handleBargeIn();
     });
-    provider.on('userSpeechStopped', () => this.emit('user.speech.ended'));
+    provider.on('userSpeechStopped', () => {
+      // Their blocked turn is now VAD-committed server-side; answer it once
+      // the protected playback finishes.
+      if (this.blockedUserTurn === 'speaking') this.blockedUserTurn = 'committed';
+      this.emit('user.speech.ended');
+    });
 
     provider.on('toolCall', (call) => void this.handleToolCall(call));
 
@@ -535,9 +558,19 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     this.emit('playback.finished', { responseId, playedMs });
     this.firstTurnDone = true;
     this.interruptions.onPlaybackEnded();
+    const hadQueuedToolResults = this.toolQueue.size > 0;
     this.flushToolQueue();
     void this.executePendingTransfer();
     this.maybeCompleteHangup();
+    // A turn the guard swallowed mid-playback gets its answer now. The
+    // server-side auto-response skipped it (a response was active at commit
+    // time), and `responseStarted` clears the flag if anything answered since.
+    // Tool activity triggers its own response covering the whole conversation
+    // (the swallowed turn included) — creating here too would double-respond.
+    if (this.blockedUserTurn === 'committed') {
+      this.blockedUserTurn = 'idle';
+      if (!hadQueuedToolResults && this.runningTools.size === 0) this.provider?.createResponse();
+    }
     this.armIdleTimer();
   }
 
@@ -547,13 +580,22 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     if (!this.generating && !this.tracker.isPlaybackActive()) return;
     const decision = this.interruptions.evaluate({ toolRunning: this.runningTools.size > 0 });
     if (!decision.allow) {
+      // Nothing is cancelled and nothing is cleared: on providers with
+      // vadInterruptControl the agent genuinely keeps talking. Remember the
+      // swallowed turn so the caller still gets an answer afterwards.
+      if (decision.cause === 'guard' || decision.cause === 'disabled') {
+        this.blockedUserTurn = 'speaking';
+      }
       this.emit('interruption.blocked', { cause: decision.cause });
       if (decision.instruction) {
         this.provider?.sendText(decision.instruction, { role: 'system', triggerResponse: true });
       }
       return;
     }
-    // Server VAD has already cancelled generation; only playback needs killing.
+    // Bridge-owned interruption: we cancel generation ourselves (server-side
+    // auto-interrupt is disabled where the provider supports it), then kill
+    // playback. On fallback providers the cancel is a benign no-op race.
+    if (this.generating) this.provider?.cancelResponse();
     this.performInterrupt();
   }
 

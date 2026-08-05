@@ -15,4 +15,13 @@ export interface ProviderCapabilities {
   resumption: boolean;
   /** Streams assistant transcript deltas (enables first-sentence detection). */
   agentTranscriptDeltas: boolean;
+  /**
+   * Server VAD's auto-interrupt can be disabled (`interrupt_response: false`),
+   * letting the bridge own barge-in: cancel/clear/truncate only when the
+   * interruption guard allows. Without it, the provider cancels generation on
+   * speech onset regardless of the guard — the guard then protects only the
+   * already-buffered Twilio audio (documented fallback, see parity tests).
+   * Optional so existing third-party providers keep compiling (absent = false).
+   */
+  vadInterruptControl?: boolean;
 }

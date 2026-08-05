@@ -83,6 +83,9 @@ export class GeminiLiveProvider extends BaseRealtimeProvider {
     transcodeRequired: true,
     resumption: true,
     agentTranscriptDeltas: true,
+    // Gemini Live's activity handling always interrupts server-side; the
+    // interruption guard falls back to protecting buffered audio only.
+    vadInterruptControl: false,
   };
 
   private readonly config: GeminiLiveProviderConfig;

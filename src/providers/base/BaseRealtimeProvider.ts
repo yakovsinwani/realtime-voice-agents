@@ -15,6 +15,14 @@ export interface VadConfig {
   /** Gemini-only sensitivities. */
   startSensitivity?: 'high' | 'low';
   endSensitivity?: 'high' | 'low';
+  /**
+   * Server-side auto-cancel of the active response on speech onset (OpenAI
+   * `interrupt_response`). Leave unset: the bridge manages it via
+   * `bridgeOwnsInterruptions` so the interruption guard actually holds.
+   */
+  interruptResponse?: boolean;
+  /** Server-side auto-response on turn commit (OpenAI `create_response`). */
+  createResponse?: boolean;
 }
 
 export interface ProviderToolSchema {
@@ -39,6 +47,13 @@ export interface ProviderSessionInit {
    * Used for handoffs, where the session config itself changes.
    */
   freshSession?: boolean;
+  /**
+   * The bridge arbitrates barge-ins (interruption guard). Providers with
+   * `vadInterruptControl` disable their server-side auto-interrupt unless the
+   * vad config sets `interruptResponse` explicitly; others ignore this flag
+   * (documented fallback: guard protects buffered audio only).
+   */
+  bridgeOwnsInterruptions?: boolean;
   /** Provider-native session options, deep-merged last (escape hatch). */
   providerOptions?: Record<string, unknown>;
 }

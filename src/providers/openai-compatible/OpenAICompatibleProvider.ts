@@ -98,6 +98,7 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
       transcodeRequired: false,
       resumption: false,
       agentTranscriptDeltas: true,
+      vadInterruptControl: true,
       ...config.capabilityOverrides,
     };
   }
@@ -108,9 +109,16 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
 
   async connect(init: ProviderSessionInit): Promise<void> {
     if (this.ws) await this.close();
+    let vad = init.vad !== undefined ? init.vad : this.config.defaultVad;
+    // Bridge-owned barge-in: the server must NOT auto-cancel the active
+    // response on speech onset, or a guard-blocked interruption still kills
+    // the sentence mid-air. An explicit vad.interruptResponse wins.
+    if (init.bridgeOwnsInterruptions && this.capabilities.vadInterruptControl && vad !== null) {
+      vad = { interruptResponse: false, ...(vad ?? { type: 'server' }) };
+    }
     this.sessionInit = {
       ...init,
-      vad: init.vad !== undefined ? init.vad : this.config.defaultVad,
+      vad,
       transcription:
         init.transcription !== undefined ? init.transcription : this.config.defaultTranscription,
     };

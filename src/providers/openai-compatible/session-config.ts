@@ -20,10 +20,18 @@ import type { ProviderSessionInit, VadConfig } from '../base/BaseRealtimeProvide
 export function buildTurnDetection(vad: VadConfig | null | undefined): Record<string, unknown> | null {
   if (vad === null) return null;
   const config = vad ?? { type: 'server' };
+  // Only set when present in the normalized config — the bridge injects
+  // interruptResponse: false via `bridgeOwnsInterruptions` on providers that
+  // support it; wire defaults stay untouched otherwise.
+  const shared = {
+    ...(config.interruptResponse !== undefined ? { interrupt_response: config.interruptResponse } : {}),
+    ...(config.createResponse !== undefined ? { create_response: config.createResponse } : {}),
+  };
   if (config.type === 'semantic') {
     return {
       type: 'semantic_vad',
       ...(config.eagerness ? { eagerness: config.eagerness } : {}),
+      ...shared,
     };
   }
   return {
@@ -31,6 +39,7 @@ export function buildTurnDetection(vad: VadConfig | null | undefined): Record<st
     ...(config.threshold !== undefined ? { threshold: config.threshold } : {}),
     ...(config.silenceDurationMs !== undefined ? { silence_duration_ms: config.silenceDurationMs } : {}),
     ...(config.prefixPaddingMs !== undefined ? { prefix_padding_ms: config.prefixPaddingMs } : {}),
+    ...shared,
   };
 }
 

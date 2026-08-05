@@ -116,6 +116,10 @@ export function xaiRealtime(options: XaiRealtimeOptions = {}): ProviderFactory {
     capabilityOverrides: {
       // conversation.item.truncate is not documented for xAI — don't send it.
       truncate: false,
+      // turn_detection.interrupt_response is not documented for xAI either;
+      // fallback: server-side auto-interrupt stays on, so the interruption
+      // guard protects only already-buffered Twilio audio (see parity tests).
+      vadInterruptControl: false,
     },
   };
   return ({ logger }) => new OpenAICompatibleProvider(config, logger);

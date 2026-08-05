@@ -81,6 +81,34 @@ describe('provider parity: one config surface', () => {
       threshold: 0.6,
       silence_duration_ms: 700,
       prefix_padding_ms: 300,
+      // vadInterruptControl: the bridge owns barge-in, so the server must not
+      // auto-cancel the active response on speech onset.
+      interrupt_response: false,
+    });
+  });
+
+  it('OpenAI: an explicit vad.interruptResponse overrides bridge ownership', async () => {
+    const server = await FakeOpenAIServer.start();
+    const bridge = new TwilioRealtimeBridge({
+      agent: AGENT,
+      provider: ({ logger }) =>
+        new OpenAICompatibleProvider({ apiKey: 'k', model: 'gpt-realtime', baseUrl: server.url }, logger),
+      session: { ...SESSION, vad: { type: 'server', interruptResponse: true, createResponse: false } },
+    });
+    cleanup.push(async () => {
+      await bridge.close();
+      await server.close();
+    });
+    const fake = new FakeTwilioMediaStream();
+    bridge.handleConnection(fake);
+    fake.connect();
+    await waitFor(() => bridge.getSession(fake.callSid)?.state === 'active');
+
+    const update = (await server.latest.waitForEvent('session.update')).session as any;
+    expect(update.audio.input.turn_detection).toEqual({
+      type: 'server_vad',
+      interrupt_response: true,
+      create_response: false,
     });
   });
 
@@ -124,6 +152,39 @@ describe('provider parity: one config surface', () => {
       prefix_padding_ms: 300,
     });
     expect(payload.session.tools.map((t: any) => t.name)).toContain('shared_tool');
+  });
+
+  it('xAI fallback (documented): no vadInterruptControl — interrupt_response is never sent', async () => {
+    // interrupt_response is undocumented for Grok Voice, so the capability is
+    // off: server-side auto-interrupt stays on and the interruption guard
+    // protects only already-buffered Twilio audio.
+    const server = await FakeOpenAIServer.start();
+    const bridge = new TwilioRealtimeBridge({
+      agent: AGENT,
+      provider: ({ logger }) =>
+        new OpenAICompatibleProvider(
+          {
+            apiKey: 'k',
+            model: 'grok-voice-latest',
+            baseUrl: server.url,
+            buildSession: buildXaiSessionUpdate,
+            capabilityOverrides: { truncate: false, vadInterruptControl: false },
+          },
+          logger,
+        ),
+      session: SESSION,
+    });
+    cleanup.push(async () => {
+      await bridge.close();
+      await server.close();
+    });
+    const fake = new FakeTwilioMediaStream();
+    bridge.handleConnection(fake);
+    fake.connect();
+    await waitFor(() => bridge.getSession(fake.callSid)?.state === 'active');
+
+    const update = (await server.latest.waitForEvent('session.update')).session as any;
+    expect(update.turn_detection.interrupt_response).toBeUndefined();
   });
 
   it('greeting user-initiates: neither provider gets an unsolicited response trigger', async () => {
