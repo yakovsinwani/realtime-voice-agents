@@ -232,7 +232,11 @@ bridge.on('session.started', (session) => {
 session: {
   greeting: { mode: 'agent-initiates' },        // 'user-initiates' to wait
   interruptions: { enabled: true },
-  deafness: { ignoreUserAudioUntilFirstTurnDone: false, muteDuringToolExecution: true },
+  deafness: {
+    ignoreUserAudioUntilFirstTurnDone: true,    // auto-false with greeting.mode 'user-initiates' (caller must be heard to start)
+    muteDuringToolExecution: true,
+    muteWhileAgentSpeaking: false,              // half-duplex: deaf while agent audio plays (caller speech is lost, not queued)
+  },
   idle: undefined,                              // { timeoutSeconds, prompts, maxNudges, goodbye }
   maxCallDurationSeconds: undefined,
   reconnect: { maxAttempts: 5, initialDelayMs: 250, maxDelayMs: 8000, jitter: true },

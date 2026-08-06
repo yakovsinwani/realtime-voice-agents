@@ -30,11 +30,25 @@ export interface GreetingOptions {
 export interface DeafnessOptions {
   /**
    * Drop caller audio until the agent's first turn finishes playing.
-   * Useful against noisy pickups talking over the greeting. Default false.
+   * Protects the greeting from noisy pickups. Default true — except with
+   * `greeting.mode: 'user-initiates'`, where the caller must be heard to
+   * start the call at all, so the default flips to false. An explicit true
+   * is honored even there, but deafens the call until something else
+   * (an idle nudge, a tool) produces the agent's first turn.
    */
   ignoreUserAudioUntilFirstTurnDone?: boolean;
   /** Drop caller audio while a foreground tool is running. Default true. */
   muteDuringToolExecution?: boolean;
+  /**
+   * Drop caller audio while agent audio is audibly playing (half-duplex).
+   * Nothing said while the agent speaks reaches the provider — it is lost,
+   * not queued — so its VAD cannot fire mid-playback. (Speech that began
+   * just before playback started is already server-side and may still
+   * barge in per the interruption settings.) Extreme-noise environments
+   * only; prefer `interruptions.enabled: false` when caller speech should
+   * still be heard and answered afterwards. Default false.
+   */
+  muteWhileAgentSpeaking?: boolean;
 }
 
 export interface IdleOptions {
@@ -95,14 +109,32 @@ export interface SessionOptions {
 export const DEFAULT_SESSION_OPTIONS: SessionOptions = {
   greeting: { mode: 'agent-initiates' },
   interruptions: { enabled: true },
-  deafness: { ignoreUserAudioUntilFirstTurnDone: false, muteDuringToolExecution: true },
+  deafness: {
+    ignoreUserAudioUntilFirstTurnDone: true,
+    muteDuringToolExecution: true,
+    muteWhileAgentSpeaking: false,
+  },
   reconnect: DEFAULT_RECONNECT_POLICY,
   hangup: { markTimeoutMs: 7000 },
   toolResultDelivery: 'afterPlayback',
 };
 
 export function resolveSessionOptions(partial?: Partial<SessionOptions>): SessionOptions {
-  return deepMerge(structuredClone(DEFAULT_SESSION_OPTIONS) as any, partial as any);
+  const resolved: SessionOptions = deepMerge(
+    structuredClone(DEFAULT_SESSION_OPTIONS) as any,
+    partial as any,
+  );
+  // A user-initiates call opens with the caller speaking; the first-turn
+  // deafness default would drop that speech and no agent turn would ever
+  // start (deadlock). The default applies only to agent-first greetings —
+  // an explicit setting is honored as written.
+  if (
+    resolved.greeting.mode === 'user-initiates' &&
+    partial?.deafness?.ignoreUserAudioUntilFirstTurnDone === undefined
+  ) {
+    resolved.deafness.ignoreUserAudioUntilFirstTurnDone = false;
+  }
+  return resolved;
 }
 
 export interface BuiltinToolsConfig {
