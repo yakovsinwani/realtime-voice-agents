@@ -1,5 +1,16 @@
 # twilio-realtime-agents
 
+## 1.2.0
+
+### Minor Changes
+
+- d38469d: **Behavior change**: `deafness.ignoreUserAudioUntilFirstTurnDone` now defaults to `true` — caller audio is dropped until the agent's first turn finishes playing, protecting the greeting from noisy pickups. With `greeting.mode: 'user-initiates'` the default stays `false` (the caller must be heard to start the call); an explicit setting is honored either way. A played pre-synthesized greeting and a silent first response (no audio, no tool work) now count as the first turn, so the deafness window always closes. Set `deafness: { ignoreUserAudioUntilFirstTurnDone: false }` to restore the previous behavior.
+- d38469d: Add `deafness.muteWhileAgentSpeaking`: drop caller audio while agent audio is audibly playing (half-duplex mode for extreme-noise environments). Caller speech during agent playback is lost, not queued — prefer `interruptions.enabled: false` when blocked speech should still be answered afterwards. Default false.
+- d7e89d4: Simpler configuration:
+
+  - **Removed** `interruptions.preventInterruptionOnFirstSentence`. It lifted when the first sentence finished _generating_ (transcript text), which happens well before the caller hears it — use `deafness.ignoreUserAudioUntilFirstTurnDone` (playback-truth based) or `guardDurationMs` instead.
+  - Provider factories now auto-detect API keys from common env var aliases when no explicit `apiKey` is passed (explicit keys always win): OpenAI `OPENAI_API_KEY`/`OPENAI_KEY`/`OPEN_AI_API_KEY`, xAI `XAI_API_KEY`/`GROK_API_KEY`/`XAI_KEY`, Gemini `GOOGLE_API_KEY`/`GEMINI_API_KEY`/`GOOGLE_GENAI_API_KEY`. The lists are exported as `*_KEY_ENV_VARS` constants.
+
 ## 1.1.3
 
 ### Patch Changes
