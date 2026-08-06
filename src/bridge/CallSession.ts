@@ -446,6 +446,13 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       }
       // A response with no audio produces no marks — settle dependents now.
       if (!this.tracker.isPlaybackActive()) {
+        // A silent turn with no tool work concludes the first turn — deafness
+        // must not wait for audio that never comes. With tool work pending,
+        // the post-tool response is the audible first turn; let its playback
+        // set the flag so the greeting keeps its protection.
+        if (this.runningTools.size === 0 && this.toolQueue.size === 0) {
+          this.firstTurnDone = true;
+        }
         // Nothing is (or will be) playing: release the guard's playback hold
         // so deferred guard rotations apply (see InterruptionController).
         this.interruptions.onPlaybackEnded();
@@ -517,6 +524,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     if (this.pregreeting && !this.pregreeting.played) return;
     if (this.deps.options.deafness.ignoreUserAudioUntilFirstTurnDone && !this.firstTurnDone) return;
     if (this.deps.options.deafness.muteDuringToolExecution && this.runningTools.size > 0) return;
+    if (this.deps.options.deafness.muteWhileAgentSpeaking && this.tracker.isPlaybackActive()) return;
     if (this.interruptions.isSuspended) return;
 
     if (this.provider?.isConnected && !this.reconnecting) {
@@ -539,6 +547,10 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     if (name === PREGREETING_MARK) {
       if (this.pregreeting && !this.pregreeting.played) {
         this.pregreeting.played = true;
+        // The pre-played greeting IS the agent's first turn: without this,
+        // first-turn deafness would outlive it (auto-greet is suppressed,
+        // so no model turn ever comes to lift it) and deafen the call.
+        this.firstTurnDone = true;
         this.emit('playback.finished', {
           responseId: 'pregreeting',
           playedMs: this.pregreeting.durationMs,

@@ -124,10 +124,70 @@ describe('bridge end-to-end (FakeTwilio ⇄ bridge ⇄ FakeOpenAI)', () => {
   });
 
   it('forwards caller audio to the provider', async () => {
-    bridge = makeBridge();
+    // Plumbing check only — opt out of first-turn deafness (default true).
+    bridge = makeBridge({ session: { deafness: { ignoreUserAudioUntilFirstTurnDone: false } } });
     await connectCall();
     fake.sendSilence(60);
     await waitFor(() => server.latest.appendedAudio.length === 3, 2000, 'audio appended upstream');
+  });
+
+  it('first-turn deafness (default): caller audio is dropped until the greeting finishes playing', async () => {
+    bridge = makeBridge();
+    await connectCall();
+
+    // The greeting is still generating/playing: caller frames must be dropped.
+    fake.sendSilence(60);
+    await delay(50);
+    expect(server.latest.appendedAudio.length).toBe(0);
+
+    server.latest.sendAudioResponse({
+      responseId: 'greet',
+      chunks: [mulawSilenceBase64(100), mulawSilenceBase64(100)],
+    });
+    await waitFor(() => fake.sentMediaPayloads.length === 2, 2000, 'greeting at Twilio');
+    await waitFor(
+      () => fake.outbound.filter((f) => f.event === 'mark').length === 2,
+      2000,
+      'first + final checkpoint marks',
+    );
+    fake.playAll();
+
+    // Mark-confirmed playout of the first turn restores hearing.
+    fake.sendSilence(60);
+    await waitFor(() => server.latest.appendedAudio.length === 3, 2000, 'audio heard after first turn');
+  });
+
+  it('muteWhileAgentSpeaking drops caller audio during playback and restores it after', async () => {
+    // First-turn deafness off so this proves the playback gate in isolation.
+    bridge = makeBridge({
+      session: {
+        deafness: { ignoreUserAudioUntilFirstTurnDone: false, muteWhileAgentSpeaking: true },
+      },
+    });
+    await connectCall();
+
+    server.latest.sendAudioResponse({
+      responseId: 'talk',
+      chunks: [mulawSilenceBase64(200), mulawSilenceBase64(200)],
+    });
+    await waitFor(() => fake.sentMediaPayloads.length === 2, 2000, 'agent audio at Twilio');
+
+    // The agent is audibly speaking: caller frames must be dropped, not queued.
+    fake.sendSilence(60);
+    await delay(50);
+    expect(server.latest.appendedAudio.length).toBe(0);
+
+    await waitFor(
+      () => fake.outbound.filter((f) => f.event === 'mark').length === 2,
+      2000,
+      'first + final checkpoint marks',
+    );
+    fake.playAll();
+    await waitFor(() => fake.queuedMs === 0, 2000, 'playback drained');
+
+    // Playback finished: hearing is restored.
+    fake.sendSilence(60);
+    await waitFor(() => server.latest.appendedAudio.length === 3, 2000, 'audio heard after playback');
   });
 
   it('handles barge-in: clear sent, truncate carries the played ms, events emitted', async () => {
@@ -601,7 +661,11 @@ describe('bridge end-to-end (FakeTwilio ⇄ bridge ⇄ FakeOpenAI)', () => {
 
   it('reconnects after a provider drop and re-injects the transcript', async () => {
     bridge = makeBridge({
-      session: { reconnect: { maxAttempts: 3, initialDelayMs: 20, maxDelayMs: 50, jitter: false } },
+      session: {
+        reconnect: { maxAttempts: 3, initialDelayMs: 20, maxDelayMs: 50, jitter: false },
+        // Reconnect-buffering check — keep first-turn deafness out of the way.
+        deafness: { ignoreUserAudioUntilFirstTurnDone: false },
+      },
     });
     const session = await connectCall();
     const reconnectEvents: string[] = [];
