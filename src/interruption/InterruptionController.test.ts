@@ -34,17 +34,6 @@ describe('InterruptionController', () => {
     expect(c.evaluate(noTool)).toEqual({ allow: true });
   });
 
-  it('first-sentence guard lifts when sentence punctuation arrives', () => {
-    const c = new InterruptionController({ preventInterruptionOnFirstSentence: true }, () => 0);
-    c.onResponseStarted('r1');
-    c.onPlaybackStarted('r1');
-    expect(c.evaluate(noTool)).toEqual({ allow: false, cause: 'guard' });
-    c.onAgentTranscriptDelta('r1', 'Hello, thanks for');
-    expect(c.evaluate(noTool)).toEqual({ allow: false, cause: 'guard' });
-    c.onAgentTranscriptDelta('r1', ' calling us today.');
-    expect(c.evaluate(noTool)).toEqual({ allow: true });
-  });
-
   it('firstResponseOnly applies the guard just once', () => {
     const now = 0;
     const c = new InterruptionController({ guardDurationMs: 1000, firstResponseOnly: true }, () => now);

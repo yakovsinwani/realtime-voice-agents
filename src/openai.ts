@@ -1,10 +1,14 @@
 /** OpenAI Realtime provider (GA API) — `twilio-realtime-agents/openai`. */
 
+import { resolveApiKey } from './internal/env.js';
 import type { ProviderFactory, VadConfig } from './providers/base/BaseRealtimeProvider.js';
 import {
   OpenAICompatibleProvider,
   type OpenAICompatibleProviderConfig,
 } from './providers/openai-compatible/OpenAICompatibleProvider.js';
+
+/** Env vars checked (in order) when no explicit apiKey is passed. */
+export const OPENAI_KEY_ENV_VARS = ['OPENAI_API_KEY', 'OPENAI_KEY', 'OPEN_AI_API_KEY'] as const;
 
 export const OPENAI_DEFAULT_MODEL = 'gpt-realtime';
 export const OPENAI_DEFAULT_VOICE = 'marin';
@@ -30,7 +34,7 @@ export const OPENAI_REALTIME_VOICES = [
 export type OpenAIRealtimeVoice = (typeof OPENAI_REALTIME_VOICES)[number];
 
 export interface OpenAIRealtimeOptions {
-  /** Defaults to process.env.OPENAI_API_KEY. */
+  /** Defaults to the first of OPENAI_API_KEY / OPENAI_KEY / OPEN_AI_API_KEY set in the env. */
   apiKey?: string;
   /** Realtime model id. Default `gpt-realtime`. */
   model?: string;
@@ -51,9 +55,11 @@ export interface OpenAIRealtimeOptions {
 
 /** Create a provider factory for the bridge (`provider: openaiRealtime({...})`). */
 export function openaiRealtime(options: OpenAIRealtimeOptions = {}): ProviderFactory {
-  const apiKey = options.apiKey ?? process.env.OPENAI_API_KEY;
+  const apiKey = resolveApiKey(options.apiKey, OPENAI_KEY_ENV_VARS);
   if (!apiKey) {
-    throw new Error('openaiRealtime: apiKey missing (pass apiKey or set OPENAI_API_KEY)');
+    throw new Error(
+      `openaiRealtime: apiKey missing (pass apiKey or set one of ${OPENAI_KEY_ENV_VARS.join('/')})`,
+    );
   }
   const config: OpenAICompatibleProviderConfig = {
     apiKey,

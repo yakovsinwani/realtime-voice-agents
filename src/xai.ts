@@ -9,6 +9,7 @@
  * Docs: https://docs.x.ai/developers/model-capabilities/audio/voice-agent
  */
 
+import { resolveApiKey } from './internal/env.js';
 import { deepMerge } from './internal/merge.js';
 import type { ProviderFactory, ProviderSessionInit, VadConfig } from './providers/base/BaseRealtimeProvider.js';
 import {
@@ -18,12 +19,15 @@ import {
 import { buildTurnDetection } from './providers/openai-compatible/session-config.js';
 
 export const XAI_BASE_URL = 'wss://api.x.ai/v1/realtime';
+
+/** Env vars checked (in order) when no explicit apiKey is passed. */
+export const XAI_KEY_ENV_VARS = ['XAI_API_KEY', 'GROK_API_KEY', 'XAI_KEY'] as const;
 /** Alias tracking xAI's flagship voice model. */
 export const XAI_DEFAULT_MODEL = 'grok-voice-latest';
 export const XAI_DEFAULT_VOICE = 'eve';
 
 export interface XaiRealtimeOptions {
-  /** Defaults to process.env.XAI_API_KEY. */
+  /** Defaults to the first of XAI_API_KEY / GROK_API_KEY / XAI_KEY set in the env. */
   apiKey?: string;
   /** `grok-voice-latest` (default), `grok-voice-think-fast-2.0`, … */
   model?: string;
@@ -78,9 +82,11 @@ export function buildXaiSessionUpdate(
 
 /** Create an xAI Grok Voice provider factory for the bridge. */
 export function xaiRealtime(options: XaiRealtimeOptions = {}): ProviderFactory {
-  const apiKey = options.apiKey ?? process.env.XAI_API_KEY;
+  const apiKey = resolveApiKey(options.apiKey, XAI_KEY_ENV_VARS);
   if (!apiKey) {
-    throw new Error('xaiRealtime: apiKey missing (pass apiKey or set XAI_API_KEY)');
+    throw new Error(
+      `xaiRealtime: apiKey missing (pass apiKey or set one of ${XAI_KEY_ENV_VARS.join('/')})`,
+    );
   }
   const transcription =
     options.transcription === false

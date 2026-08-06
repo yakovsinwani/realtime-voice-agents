@@ -3,10 +3,9 @@
  *
  * Gate order (first match wins): disabled → suspended (noise cooldown) →
  * tool running → guard window. The guard window protects the start of a
- * response two ways: a flat duration from playback start, and/or "first
- * sentence" (ends when sentence-final punctuation appears in the agent
- * transcript stream — generation runs ahead of playback, so this is a
- * conservative approximation; combine with guardDurationMs to tune).
+ * response for a flat duration measured from playback start (mark-echo
+ * truth, not generation time). To make the whole first turn uninterruptible,
+ * use `deafness.ignoreUserAudioUntilFirstTurnDone` instead.
  *
  * The rate limiter is the noisy-environment defense from production systems:
  * too many barge-ins inside a sliding window suspends interruptions until the
@@ -27,8 +26,6 @@ export interface InterruptionSettings {
   enabled?: boolean;
   /** No-barge window measured from playback start of each response, ms. */
   guardDurationMs?: number;
-  /** Block interruptions until the response's first sentence completes. */
-  preventInterruptionOnFirstSentence?: boolean;
   /** Apply the guard only to the first response of the call. Default false. */
   firstResponseOnly?: boolean;
   rateLimit?: InterruptionRateLimit;
@@ -45,8 +42,6 @@ export type InterruptionDecision =
   | { allow: true }
   | { allow: false; cause: InterruptionBlockCause; instruction?: string };
 
-const SENTENCE_END = /[.!?။。？！…]/;
-
 export class InterruptionController {
   private readonly settings: InterruptionSettings;
   private readonly now: () => number;
@@ -58,8 +53,6 @@ export class InterruptionController {
   private guardPlaybackOpen = false;
   /** Responses that began while the guarded one was still playing. */
   private deferredStarts = 0;
-  private firstSentenceDone = true;
-  private transcriptBuffer = '';
   private suspended = false;
   private bargeInTimestamps: number[] = [];
 
@@ -72,7 +65,7 @@ export class InterruptionController {
     return this.suspended;
   }
 
-  /** A new response started generating: reset first-sentence tracking. */
+  /** A new response started generating: rotate the guard to it. */
   onResponseStarted(responseId: string): void {
     // A response that begins while the guarded response is still audibly
     // playing (e.g. the server auto-answering a guard-blocked caller turn —
@@ -89,20 +82,11 @@ export class InterruptionController {
     this.guardResponseId = responseId;
     this.guardStartedAt = null;
     this.guardPlaybackOpen = true;
-    this.transcriptBuffer = '';
-    this.firstSentenceDone = !this.settings.preventInterruptionOnFirstSentence;
   }
 
   /** Playback of a response reached the caller: the guard clock starts now. */
   onPlaybackStarted(responseId: string): void {
     if (responseId === this.guardResponseId) this.guardStartedAt = this.now();
-  }
-
-  /** Agent transcript delta: first sentence completes on final punctuation. */
-  onAgentTranscriptDelta(responseId: string, delta: string): void {
-    if (this.firstSentenceDone || responseId !== this.guardResponseId) return;
-    this.transcriptBuffer += delta;
-    if (SENTENCE_END.test(this.transcriptBuffer)) this.firstSentenceDone = true;
   }
 
   /** Current playback finished or was cleared: cooldown suspension ends. */
@@ -144,18 +128,13 @@ export class InterruptionController {
   }
 
   private guardActive(): boolean {
-    const { guardDurationMs, preventInterruptionOnFirstSentence, firstResponseOnly } =
-      this.settings;
-    if (!guardDurationMs && !preventInterruptionOnFirstSentence) return false;
+    const { guardDurationMs, firstResponseOnly } = this.settings;
+    if (!guardDurationMs) return false;
     if (firstResponseOnly && this.responseIndex > 1) return false;
 
-    if (preventInterruptionOnFirstSentence && !this.firstSentenceDone) return true;
-    if (guardDurationMs) {
-      // Guard until playback has run for guardDurationMs. If playback hasn't
-      // started yet, the response is at its very beginning — still guarded.
-      if (this.guardStartedAt === null) return true;
-      if (this.now() - this.guardStartedAt < guardDurationMs) return true;
-    }
-    return false;
+    // Guard until playback has run for guardDurationMs. If playback hasn't
+    // started yet, the response is at its very beginning — still guarded.
+    if (this.guardStartedAt === null) return true;
+    return this.now() - this.guardStartedAt < guardDurationMs;
   }
 }

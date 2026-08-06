@@ -180,7 +180,6 @@ twilio: { accountSid, authToken },                      // enables the REST cont
 session: {
   interruptions: {
     guardDurationMs: 1500,                 // no barge-in for the first 1.5s of each reply
-    preventInterruptionOnFirstSentence: true,
     firstResponseOnly: false,
     rateLimit: {                           // noisy-environment defense
       windowMs: 30_000, threshold: 4,

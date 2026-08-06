@@ -455,10 +455,6 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       }
     });
 
-    provider.on('agentTranscriptDelta', ({ responseId, delta }) => {
-      this.interruptions.onAgentTranscriptDelta(responseId, delta);
-    });
-
     provider.on('agentTranscript', ({ responseId, text }) => {
       const entry: TranscriptEntry = {
         role: 'agent',

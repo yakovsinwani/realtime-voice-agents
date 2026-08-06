@@ -1,5 +1,6 @@
 /** Google Gemini Live provider — `twilio-realtime-agents/gemini`. */
 
+import { resolveApiKey } from './internal/env.js';
 import type { ProviderFactory, VadConfig } from './providers/base/BaseRealtimeProvider.js';
 import {
   GeminiLiveProvider,
@@ -9,12 +10,19 @@ import {
   type GeminiConnectParams,
 } from './providers/gemini/GeminiLiveProvider.js';
 
+/** Env vars checked (in order) when no explicit apiKey is passed. */
+export const GEMINI_KEY_ENV_VARS = [
+  'GOOGLE_API_KEY',
+  'GEMINI_API_KEY',
+  'GOOGLE_GENAI_API_KEY',
+] as const;
+
 export const GEMINI_DEFAULT_MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
 export const GEMINI_DEFAULT_VOICE = 'Aoede';
 export const GEMINI_VOICES = ['Aoede', 'Charon', 'Fenrir', 'Kore', 'Puck'] as const;
 
 export interface GeminiLiveOptions {
-  /** Google AI Studio key. Defaults to process.env.GOOGLE_API_KEY / GEMINI_API_KEY. */
+  /** Google AI Studio key. Defaults to the first of GOOGLE_API_KEY / GEMINI_API_KEY / GOOGLE_GENAI_API_KEY set in the env. */
   apiKey?: string;
   /** Vertex AI instead of API-key auth (Application Default Credentials). */
   vertex?: { project: string; location: string };
@@ -39,10 +47,10 @@ export interface GeminiLiveOptions {
 
 /** Create a Gemini Live provider factory for the bridge. */
 export function geminiLive(options: GeminiLiveOptions = {}): ProviderFactory {
-  const apiKey = options.apiKey ?? process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY;
+  const apiKey = resolveApiKey(options.apiKey, GEMINI_KEY_ENV_VARS);
   if (!apiKey && !options.vertex && !options.connector) {
     throw new Error(
-      'geminiLive: credentials missing (pass apiKey, set GOOGLE_API_KEY/GEMINI_API_KEY, or configure vertex)',
+      `geminiLive: credentials missing (pass apiKey, set one of ${GEMINI_KEY_ENV_VARS.join('/')}, or configure vertex)`,
     );
   }
   const config: GeminiLiveProviderConfig = {
