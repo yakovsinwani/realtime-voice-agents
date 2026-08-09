@@ -1,7 +1,7 @@
 # realtime-voice-agents
 
 [![npm version](https://img.shields.io/npm/v/realtime-voice-agents)](https://www.npmjs.com/package/realtime-voice-agents)
-[![CI](https://github.com/yakovsinwani/twilio-realtime-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/yakovsinwani/twilio-realtime-agents/actions/workflows/ci.yml)
+[![CI](https://github.com/yakovsinwani/realtime-voice-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/yakovsinwani/realtime-voice-agents/actions/workflows/ci.yml)
 [![node](https://img.shields.io/node/v/realtime-voice-agents)](https://www.npmjs.com/package/realtime-voice-agents)
 [![license](https://img.shields.io/npm/l/realtime-voice-agents)](LICENSE)
 
