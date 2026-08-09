@@ -1,4 +1,4 @@
-/** Session store interface + in-memory implementation — `twilio-realtime-agents/store`. */
+/** Session store interface + in-memory implementation — `realtime-voice-agents/store`. */
 export type { SessionStore } from './session/SessionStore.js';
 export type { CallSnapshot } from './session/snapshot.js';
 export { InMemorySessionStore } from './session/InMemorySessionStore.js';

@@ -1,5 +1,5 @@
 {
-  "name": "twilio-realtime-agents-example-fastify",
+  "name": "realtime-voice-agents-example-fastify",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,7 +12,7 @@
     "@fastify/websocket": "^11.0.0",
     "fastify": "^5.0.0",
     "twilio": "^6.0.0",
-    "twilio-realtime-agents": "file:../..",
+    "realtime-voice-agents": "file:../..",
     "zod": "^4.0.0"
   },
   "devDependencies": {

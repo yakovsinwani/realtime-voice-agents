@@ -2,8 +2,8 @@
 
 import express from 'express';
 import expressWs from 'express-ws';
-import { Agent, TwilioRealtimeBridge, connectStreamTwiml, consoleLogger } from 'twilio-realtime-agents';
-import { openaiRealtime } from 'twilio-realtime-agents/openai';
+import { Agent, TwilioRealtimeBridge, connectStreamTwiml, consoleLogger } from 'realtime-voice-agents';
+import { openaiRealtime } from 'realtime-voice-agents/openai';
 
 const PUBLIC_WS_URL = process.env.PUBLIC_WS_URL ?? 'wss://example.ngrok.app';
 

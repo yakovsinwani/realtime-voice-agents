@@ -16,7 +16,7 @@ npm run assets:generate  # re-synthesize assets/*.ulaw hold-audio loops
 
 ## What this is
 
-`twilio-realtime-agents` — a public npm package bridging **Twilio Media Streams** (WebSocket, μ-law 8 kHz) to **realtime speech-to-speech APIs**: OpenAI Realtime (GA protocol ONLY — never add beta wire shapes like `g711_ulaw`/`response.audio.delta`), xAI Grok Voice (OpenAI-compatible, own session shape), and Gemini Live (via `@google/genai`, optional peer).
+`realtime-voice-agents` — a public npm package bridging **Twilio Media Streams** (WebSocket, μ-law 8 kHz) to **realtime speech-to-speech APIs**: OpenAI Realtime (GA protocol ONLY — never add beta wire shapes like `g711_ulaw`/`response.audio.delta`), xAI Grok Voice (OpenAI-compatible, own session shape), and Gemini Live (via `@google/genai`, optional peer).
 
 ## Architecture invariants
 

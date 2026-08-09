@@ -1,5 +1,5 @@
 {
-  "name": "twilio-realtime-agents-example-express",
+  "name": "realtime-voice-agents-example-express",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,7 +8,7 @@
   "dependencies": {
     "express": "^5.0.0",
     "express-ws": "^5.0.2",
-    "twilio-realtime-agents": "file:../..",
+    "realtime-voice-agents": "file:../..",
     "zod": "^4.0.0"
   },
   "devDependencies": {

@@ -1,9 +1,9 @@
-# twilio-realtime-agents
+# realtime-voice-agents
 
-[![npm version](https://img.shields.io/npm/v/twilio-realtime-agents)](https://www.npmjs.com/package/twilio-realtime-agents)
+[![npm version](https://img.shields.io/npm/v/realtime-voice-agents)](https://www.npmjs.com/package/realtime-voice-agents)
 [![CI](https://github.com/yakovsinwani/twilio-realtime-agents/actions/workflows/ci.yml/badge.svg)](https://github.com/yakovsinwani/twilio-realtime-agents/actions/workflows/ci.yml)
-[![node](https://img.shields.io/node/v/twilio-realtime-agents)](https://www.npmjs.com/package/twilio-realtime-agents)
-[![license](https://img.shields.io/npm/l/twilio-realtime-agents)](LICENSE)
+[![node](https://img.shields.io/node/v/realtime-voice-agents)](https://www.npmjs.com/package/realtime-voice-agents)
+[![license](https://img.shields.io/npm/l/realtime-voice-agents)](LICENSE)
 
 **Provider-agnostic bridge between Twilio Media Streams and realtime speech-to-speech AI.** Build phone voice agents in Node.js with one `Agent` / `tool()` / session API across **OpenAI Realtime**, **xAI Grok Voice**, and **Gemini Live** — with multi-agent handoffs, tool execution strategies, hardware-confirmed playback tracking, true barge-in, and hold audio.
 
@@ -25,7 +25,7 @@ Bridging a phone call to a realtime model looks like "pipe two WebSockets togeth
 ## Install
 
 ```bash
-npm install twilio-realtime-agents zod
+npm install realtime-voice-agents zod
 # optional, per feature:
 npm install twilio         # REST hangup/transfer/SMS
 npm install @google/genai  # Gemini Live provider
@@ -33,14 +33,16 @@ npm install @google/genai  # Gemini Live provider
 
 Node 20+. Zod 3.25+ or 4.
 
+> Previously published as `twilio-realtime-agents` (through 1.2.0, now deprecated). v2 is the same package under the new name — no API changes, only the import specifier. Swap the dependency and update your imports.
+
 ## Quick start
 
 ```ts
 import Fastify from 'fastify';
 import websocket from '@fastify/websocket';
 import * as z from 'zod';
-import { Agent, TwilioRealtimeBridge, connectStreamTwiml, tool } from 'twilio-realtime-agents';
-import { openaiRealtime } from 'twilio-realtime-agents/openai';
+import { Agent, TwilioRealtimeBridge, connectStreamTwiml, tool } from 'realtime-voice-agents';
+import { openaiRealtime } from 'realtime-voice-agents/openai';
 
 const weather = tool({
   name: 'get_weather',
@@ -78,9 +80,9 @@ Point your Twilio number's Voice webhook at `POST /twilio/voice`. That's a worki
 ## Providers
 
 ```ts
-import { openaiRealtime } from 'twilio-realtime-agents/openai';
-import { xaiRealtime } from 'twilio-realtime-agents/xai';
-import { geminiLive } from 'twilio-realtime-agents/gemini';
+import { openaiRealtime } from 'realtime-voice-agents/openai';
+import { xaiRealtime } from 'realtime-voice-agents/xai';
+import { geminiLive } from 'realtime-voice-agents/gemini';
 
 openaiRealtime({
   model: 'gpt-realtime',
@@ -196,7 +198,7 @@ Blocked attempts emit `interruption.blocked` with a cause (`guard` | `rate_limit
 The slowest part of answering is the provider handshake. Pre-record the greeting once, and the bridge burst-writes it onto the call **while the session is still connecting** — then keeps the model from greeting twice (instruction reinforcement + assistant-turn seeding + suppressed auto-greet) and gates caller audio until Twilio's mark confirms playout.
 
 ```ts
-import { captureGreetingAudio } from 'twilio-realtime-agents';
+import { captureGreetingAudio } from 'realtime-voice-agents';
 
 // once, at deploy/config time — records from a real session so the voice matches:
 const { audio } = await captureGreetingAudio({
@@ -255,7 +257,7 @@ Outbound calls: the greeting waits for a human — feed your status callback int
 
 ## Testing without phone calls
 
-`twilio-realtime-agents/testing` ships the harness this package is tested with:
+`realtime-voice-agents/testing` ships the harness this package is tested with:
 
 - **`FakeTwilioMediaStream`** — a scripted caller with an exact playout simulation: marks echo only after the media before them "plays"; `clear` discards buffered audio and echoes pending marks, like real Twilio.
 - **`FakeOpenAIServer`** — a real-WebSocket GA-protocol server you script (`sendAudioResponse`, `sendToolCall`, `sendSpeechStarted`, drops).
@@ -276,7 +278,7 @@ caller.advancePlayback(200); // deterministic playout — assert on playback eve
 
 ## Subpath exports
 
-`twilio-realtime-agents` (core) · `/openai` · `/xai` · `/gemini` · `/twilio` (wire types, TwiML, REST) · `/audio` (μ-law, resampler, transcoders, background player) · `/store` (SessionStore + in-memory) · `/testing`.
+`realtime-voice-agents` (core) · `/openai` · `/xai` · `/gemini` · `/twilio` (wire types, TwiML, REST) · `/audio` (μ-law, resampler, transcoders, background player) · `/store` (SessionStore + in-memory) · `/testing`.
 
 ## Observability & state
 

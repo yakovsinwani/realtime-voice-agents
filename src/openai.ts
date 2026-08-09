@@ -1,4 +1,4 @@
-/** OpenAI Realtime provider (GA API) — `twilio-realtime-agents/openai`. */
+/** OpenAI Realtime provider (GA API) — `realtime-voice-agents/openai`. */
 
 import { resolveApiKey } from './internal/env.js';
 import type { ProviderFactory, VadConfig } from './providers/base/BaseRealtimeProvider.js';
