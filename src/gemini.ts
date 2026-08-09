@@ -1,4 +1,4 @@
-/** Google Gemini Live provider — `twilio-realtime-agents/gemini`. */
+/** Google Gemini Live provider — `realtime-voice-agents/gemini`. */
 
 import { resolveApiKey } from './internal/env.js';
 import type { ProviderFactory, VadConfig } from './providers/base/BaseRealtimeProvider.js';

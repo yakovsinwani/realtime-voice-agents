@@ -21,8 +21,8 @@ import {
   connectStreamTwiml,
   consoleLogger,
   tool,
-} from 'twilio-realtime-agents';
-import { openaiRealtime } from 'twilio-realtime-agents/openai';
+} from 'realtime-voice-agents';
+import { openaiRealtime } from 'realtime-voice-agents/openai';
 
 const PORT = Number(process.env.PORT ?? 3000);
 /** Public wss:// URL of this server (your ngrok host). */

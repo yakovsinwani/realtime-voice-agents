@@ -1,5 +1,5 @@
 /**
- * xAI Grok Voice Agent provider — `twilio-realtime-agents/xai`.
+ * xAI Grok Voice Agent provider — `realtime-voice-agents/xai`.
  *
  * The Voice Agent API is OpenAI-Realtime-compatible on the wire (GA event
  * names, `audio/pcmu` at 8 kHz supported → zero transcoding), with a slightly

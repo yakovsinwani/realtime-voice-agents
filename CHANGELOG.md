@@ -1,4 +1,4 @@
-# twilio-realtime-agents
+# realtime-voice-agents
 
 ## 1.2.0
 
