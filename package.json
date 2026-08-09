@@ -151,10 +151,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yakovsinwani/twilio-realtime-agents.git"
+    "url": "git+https://github.com/yakovsinwani/realtime-voice-agents.git"
   },
   "bugs": {
-    "url": "https://github.com/yakovsinwani/twilio-realtime-agents/issues"
+    "url": "https://github.com/yakovsinwani/realtime-voice-agents/issues"
   },
   "publishConfig": {
     "access": "public",
