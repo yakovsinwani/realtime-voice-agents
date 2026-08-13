@@ -193,6 +193,41 @@ session: {
 
 Blocked attempts emit `interruption.blocked` with a cause (`guard` | `rate_limit` | `tool_running` | …). Honored ones flush Twilio, truncate the model's context to the heard milliseconds, and emit `playback.interrupted` with exactly how much the caller heard.
 
+## Noise-adaptive VAD (opt-in)
+
+Server VAD tuned for quiet rooms misfires on noisy lines — street, car, speakerphone — as phantom barge-ins and chopped replies. `noiseAdaptiveVad` measures the line itself: a per-frame μ-law meter estimates the caller's noise floor (a low percentile over a sliding window, so speech doesn't read as noise), and when it stays high, the bridge escalates turn detection mid-call.
+
+```ts
+session: {
+  vad: { type: 'server', threshold: 0.5 },
+  noiseAdaptiveVad: {},                  // {} = defaults below
+  // mode: 'auto',                       // 'suggest' = events only, you apply
+  // noiseFloorDb: -45,                  // trigger floor, dBFS
+  // windowMs: 5000, sustainMs: 3000,    // how much/how long analyzed audio
+  // cooldownMs: 15_000, maxSteps: 1,    // escalation pacing (per call)
+  // thresholdStep: 0.1, maxThreshold: 0.9,
+}
+```
+
+How a step lands, per provider:
+
+| Provider | Escalation |
+| --- | --- |
+| OpenAI | `threshold` +0.1/step, auto-applied via ack-gated `session.update`; baseline = your `vad.threshold`, else OpenAI's documented 0.5 |
+| xAI | same, from xAI's documented **0.85** default, clamped to its 0.1–0.9 range |
+| Gemini | `vad.suggestion` event only (`startSensitivity: 'low'` analog) — the Live API has no mid-session config updates |
+| semantic VAD | `vad.suggestion` event only: `eagerness: 'low'` trades **end-of-turn latency** (waits up to ~8s) for stability, so that call is yours |
+
+The baseline comes from the provider's ACKnowledged effective config plus its declared `capabilities.vadTuning` profile — never guessed (assuming 0.5 on xAI would *lower* its 0.85 default). Escalation is one-way per call: steps up, never back down; `maxSteps` and `cooldownMs` bound the blast radius.
+
+Every decision emits `vad.suggestion` (recommended config + `noiseFloorDb`/`analyzedMs`/`elapsedMs` metrics); an applied-and-acknowledged step also emits `vad.adjusted`. In `mode: 'suggest'` nothing is applied automatically — accept with `session.updateVad(info.suggested)`, which persists across reconnects and rebases future escalation on top of it. `updateVad(null)` disables turn detection AND suspends adaptation (it never re-enables VAD by itself).
+
+Fine print:
+
+- Caller speech, agent playback (speakerphone bleed), and the pre-synthesized greeting are excluded from the floor estimate — a long monologue in a quiet room never escalates. `windowMs` counts **analyzed** idle-line audio, so warmup can span 30–60s of real conversation; the metrics exist to tune this from field data.
+- Enabling the feature also serializes ALL mid-call session updates for that session: one in flight, acknowledged before the next; an ack timeout reconnects into known-good state. Disabled = the legacy fire-and-forget behavior, untouched.
+- Complementary knobs: OpenAI's native `audio.input.noise_reduction` (reachable via the provider's `sessionOptions`) runs before VAD and may fix much of the problem upstream; `interruptions.rateLimit` reacts to barge-in churn after the fact, while this reacts to the audio itself. All three coexist.
+
 ## Pre-synthesized greeting (~1.5s to first word)
 
 The slowest part of answering is the provider handshake. Pre-record the greeting once, and the bridge burst-writes it onto the call **while the session is still connecting** — then keeps the model from greeting twice (instruction reinforcement + assistant-turn seeding + suppressed auto-greet) and gates caller audio until Twilio's mark confirms playout.
@@ -217,7 +252,7 @@ Bundled presets (all synthesized, license-free, seamless loops): `elevator-jazz`
 
 ## Events (session)
 
-`call.started/ended/failed` · `provider.connected/reconnecting/reconnected/closed` · `agent.speech.started/ended` (generation) · **`playback.started/finished/interrupted`** (what the caller heard, mark-confirmed) · `user.speech.started/ended` · `transcript.user/agent` · `tool.started/completed/failed` · `tool.approval.required` · `agent.handoff` · `interruption` / `interruption.blocked` · `background_audio.started/stopped` · `dtmf` · `usage.updated` · `error`.
+`call.started/ended/failed` · `provider.connected/reconnecting/reconnected/closed` · `agent.speech.started/ended` (generation) · **`playback.started/finished/interrupted`** (what the caller heard, mark-confirmed) · `user.speech.started/ended` · `transcript.user/agent` · `tool.started/completed/failed` · `tool.approval.required` · `agent.handoff` · `interruption` / `interruption.blocked` · `vad.suggestion` / `vad.adjusted` (noise-adaptive VAD) · `background_audio.started/stopped` · `dtmf` · `usage.updated` · `error`.
 
 ```ts
 bridge.on('session.started', (session) => {
@@ -244,6 +279,7 @@ session: {
   reconnect: { maxAttempts: 5, initialDelayMs: 250, maxDelayMs: 8000, jitter: true },
   hangup: { markTimeoutMs: 7000 },              // goodbye watchdog
   vad: undefined,                               // normalized VAD, mapped per provider
+  noiseAdaptiveVad: undefined,                  // opt-in noise → VAD escalation ({} enables; see its section)
   toolResultDelivery: 'afterPlayback',          // or 'immediate'
   toolBackgroundAudio: undefined,               // default hold audio for tools
   handoffVoicePolicy: 'keep',                   // or 'reconnect' to switch voices

@@ -54,6 +54,13 @@ export interface ProviderSessionInit {
    * (documented fallback: guard protects buffered audio only).
    */
   bridgeOwnsInterruptions?: boolean;
+  /**
+   * Serialize mid-session updates: one session.update in flight at a time,
+   * each acknowledged (or timed out) before the next is sent. Set by the
+   * bridge when noise-adaptive VAD is configured; absent/false keeps the
+   * legacy fire-and-forget update behavior exactly as before.
+   */
+  serializedSessionUpdates?: boolean;
   /** Provider-native session options, deep-merged last (escape hatch). */
   providerOptions?: Record<string, unknown>;
 }
@@ -67,6 +74,16 @@ export interface SendTextOptions {
 
 export interface SendToolResultOptions {
   triggerResponse?: boolean;
+}
+
+export interface SessionUpdateOptions {
+  /**
+   * Resolve with the provider's acknowledgement of THIS update (`true`) rather
+   * than at send time. Meaningful only with serialized session updates (see
+   * `ProviderSessionInit.serializedSessionUpdates`); providers without ack
+   * support resolve `false`/`void`, which callers treat as not-acknowledged.
+   */
+  awaitAck?: boolean;
 }
 
 /**
@@ -92,8 +109,27 @@ export abstract class BaseRealtimeProvider extends TypedEmitter<ProviderEvents> 
   abstract sendToolResult(callId: string, output: unknown, options?: SendToolResultOptions): void;
   /** Trigger an out-of-band assistant response (greeting, nudge, announcement). */
   abstract createResponse(options?: { instructions?: string }): void;
-  /** Mid-session config change (instructions/tools/voice) where supported. */
-  abstract updateSession(patch: Partial<ProviderSessionInit>): Promise<void>;
+  /**
+   * Mid-session config change (instructions/tools/voice/vad) where supported.
+   * Return `true` to signal the provider ACKNOWLEDGED the update — the
+   * noise-adaptive VAD auto-commit requires it. The `boolean | void` return
+   * keeps existing third-party `Promise<void>` implementations compiling;
+   * anything other than `true` is treated as not-acknowledged.
+   */
+  abstract updateSession(
+    patch: Partial<ProviderSessionInit>,
+    options?: SessionUpdateOptions,
+  ): Promise<boolean | void>;
+  /**
+   * The last ACKNOWLEDGED turn-detection config on the live session — what was
+   * actually sent and confirmed, never desired/pending state. Undefined until
+   * the provider reports one (third-party providers may never set it).
+   */
+  getEffectiveVad(): VadConfig | null | undefined {
+    return this.effectiveVadValue;
+  }
+  /** Set by subclasses when a config carrying `vad` is acknowledged. */
+  protected effectiveVadValue: VadConfig | null | undefined = undefined;
   /** Interrupt in-flight generation (where the wire protocol supports it). */
   cancelResponse(): void {}
   /** Trim the last assistant item to what the caller actually heard. */

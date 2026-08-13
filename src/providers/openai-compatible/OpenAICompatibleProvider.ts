@@ -17,6 +17,7 @@ import {
   type ProviderSessionInit,
   type SendTextOptions,
   type SendToolResultOptions,
+  type SessionUpdateOptions,
   type VadConfig,
 } from '../base/BaseRealtimeProvider.js';
 import type { ProviderCapabilities } from '../base/capabilities.js';
@@ -37,6 +38,12 @@ export interface OpenAICompatibleProviderConfig {
   /** Provider-native session fields, deep-merged into session.update last. */
   extraSessionOptions?: Record<string, unknown>;
   connectTimeoutMs?: number;
+  /**
+   * How long a serialized session.update may wait for its session.updated ack
+   * before the connection is treated as desynced and dropped for reconnect.
+   * Only used with `serializedSessionUpdates`. Default 3000.
+   */
+  sessionUpdateAckTimeoutMs?: number;
   capabilityOverrides?: Partial<ProviderCapabilities>;
   /** Provider display name for logs/events (e.g. 'openai', 'xai'). */
   providerName?: string;
@@ -63,6 +70,21 @@ interface PendingResponseCreate {
 /** WS close codes where retrying cannot help (protocol/auth/policy failures). */
 const NON_RETRIABLE_CLOSE_CODES = new Set([1002, 1003, 1007, 1008]);
 
+/**
+ * One serialized session.update. The wire payload is snapshotted at enqueue —
+ * later patches merge into sessionInit but must never contaminate an earlier
+ * update's payload or its ack bookkeeping (`resolvedVad` is what an ack
+ * commits to effectiveVad, NOT whatever sessionInit.vad holds by then).
+ */
+interface PendingSessionUpdate {
+  payload: Record<string, unknown>;
+  touchesVad: boolean;
+  resolvedVad: VadConfig | null | undefined;
+  resolveSent: (sent: boolean) => void;
+  resolveAck: (acked: boolean) => void;
+  ackTimer: NodeJS.Timeout | null;
+}
+
 export class OpenAICompatibleProvider extends BaseRealtimeProvider {
   readonly name: string;
   readonly capabilities: ProviderCapabilities;
@@ -85,6 +107,10 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
   private responseActive = false;
   private pendingCreate: PendingResponseCreate | null = null;
   private lastCreateSent: PendingResponseCreate | null = null;
+  /** Serialized-update pipeline (enabled via init.serializedSessionUpdates). */
+  private serializedUpdates = false;
+  private updateQueue: PendingSessionUpdate[] = [];
+  private updateInFlight: PendingSessionUpdate | null = null;
 
   constructor(config: OpenAICompatibleProviderConfig, logger: Logger = noopLogger) {
     super();
@@ -109,16 +135,11 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
 
   async connect(init: ProviderSessionInit): Promise<void> {
     if (this.ws) await this.close();
-    let vad = init.vad !== undefined ? init.vad : this.config.defaultVad;
-    // Bridge-owned barge-in: the server must NOT auto-cancel the active
-    // response on speech onset, or a guard-blocked interruption still kills
-    // the sentence mid-air. An explicit vad.interruptResponse wins.
-    if (init.bridgeOwnsInterruptions && this.capabilities.vadInterruptControl && vad !== null) {
-      vad = { interruptResponse: false, ...(vad ?? { type: 'server' }) };
-    }
+    this.failPendingUpdates(); // defensive — the close above already settled them
+    this.serializedUpdates = init.serializedSessionUpdates === true;
     this.sessionInit = {
       ...init,
-      vad,
+      vad: this.resolveVad(init.vad, init.bridgeOwnsInterruptions),
       transcription:
         init.transcription !== undefined ? init.transcription : this.config.defaultTranscription,
     };
@@ -213,6 +234,9 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
       ws.on('close', (code, reasonBuf) => {
         const reason = reasonBuf?.toString();
         this.ready = false;
+        // The ack pipeline dies with the socket: settle everything as
+        // not-acked so no caller hangs (a reconnect re-sends full config).
+        this.failPendingUpdates();
         if (!settled) {
           fail(new Error(`${this.name} socket closed during setup (${code} ${reason ?? ''})`));
           return;
@@ -224,6 +248,8 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
         });
       });
     });
+    // The handshake's session.updated is the ack for the connect-time config.
+    this.effectiveVadValue = this.sessionInit.vad;
   }
 
   async close(): Promise<void> {
@@ -305,10 +331,107 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
     });
   }
 
-  async updateSession(patch: Partial<ProviderSessionInit>): Promise<void> {
+  async updateSession(
+    patch: Partial<ProviderSessionInit>,
+    options: SessionUpdateOptions = {},
+  ): Promise<boolean> {
     if (!this.sessionInit) throw new Error('updateSession before connect');
-    this.sessionInit = { ...this.sessionInit, ...patch };
-    this.send(this.buildSessionPayload());
+    let resolved = patch;
+    if ('vad' in patch) {
+      // Re-apply the bridge-owned barge-in injection: a raw vad patch would
+      // replace sessionInit.vad wholesale and silently re-enable server-side
+      // auto-interrupt (see resolveVad).
+      resolved = { ...patch, vad: this.resolveVad(patch.vad, this.sessionInit.bridgeOwnsInterruptions) };
+    }
+    this.sessionInit = { ...this.sessionInit, ...resolved };
+
+    if (!this.serializedUpdates) {
+      // Legacy fire-and-forget: send immediately, no ack tracking. No
+      // effectiveVad refresh here — that field means ACKed truth only.
+      const open = this.ws?.readyState === WebSocket.OPEN;
+      this.send(this.buildSessionPayload());
+      return open;
+    }
+
+    let resolveSent!: (sent: boolean) => void;
+    let resolveAck!: (acked: boolean) => void;
+    const sent = new Promise<boolean>((resolve) => (resolveSent = resolve));
+    const acked = new Promise<boolean>((resolve) => (resolveAck = resolve));
+    this.updateQueue.push({
+      // Snapshot NOW: the payload reflects sessionInit as of THIS patch even
+      // when later patches merge before it reaches the head of the queue.
+      payload: this.buildSessionPayload(),
+      touchesVad: 'vad' in resolved,
+      resolvedVad: resolved.vad,
+      resolveSent,
+      resolveAck,
+      ackTimer: null,
+    });
+    this.pumpUpdateQueue();
+    return options.awaitAck ? acked : sent;
+  }
+
+  /**
+   * Bridge-owned barge-in: the server must NOT auto-cancel the active
+   * response on speech onset, or a guard-blocked interruption still kills
+   * the sentence mid-air. An explicit vad.interruptResponse wins (spread
+   * order). Applied on connect AND on every vad patch.
+   */
+  private resolveVad(
+    vad: VadConfig | null | undefined,
+    bridgeOwnsInterruptions: boolean | undefined,
+  ): VadConfig | null | undefined {
+    let resolved = vad !== undefined ? vad : this.config.defaultVad;
+    if (bridgeOwnsInterruptions && this.capabilities.vadInterruptControl && resolved !== null) {
+      resolved = { interruptResponse: false, ...(resolved ?? { type: 'server' }) };
+    }
+    return resolved;
+  }
+
+  /** Send the next queued update once nothing is awaiting its ack. */
+  private pumpUpdateQueue(): void {
+    if (this.updateInFlight || this.updateQueue.length === 0) return;
+    if (this.ws?.readyState !== WebSocket.OPEN) {
+      // No live socket: settle everything as unsent/not-acked — a reconnect
+      // re-sends the full session config anyway.
+      this.failPendingUpdates();
+      return;
+    }
+    const entry = this.updateQueue.shift()!;
+    this.updateInFlight = entry;
+    this.send(entry.payload);
+    entry.resolveSent(true);
+    const timeoutMs = this.config.sessionUpdateAckTimeoutMs ?? 3000;
+    entry.ackTimer = setTimeout(() => {
+      entry.ackTimer = null;
+      if (this.updateInFlight !== entry) return;
+      this.updateInFlight = null;
+      entry.resolveAck(false);
+      // The ack stream is untrusted after a miss — a late ack could otherwise
+      // acknowledge the WRONG update. Desync: drop the socket and let the
+      // session layer reconnect into a freshly-acked, known-good state.
+      this.logger.warn('session.update not acknowledged in time — desyncing the connection', {
+        timeoutMs,
+      });
+      this.ws?.terminate();
+    }, timeoutMs);
+    entry.ackTimer.unref?.();
+  }
+
+  /** Settle every queued/in-flight update as not-acked (socket gone/replaced). */
+  private failPendingUpdates(): void {
+    const inFlight = this.updateInFlight;
+    this.updateInFlight = null;
+    if (inFlight) {
+      if (inFlight.ackTimer) clearTimeout(inFlight.ackTimer);
+      inFlight.resolveAck(false);
+    }
+    const queued = this.updateQueue;
+    this.updateQueue = [];
+    for (const entry of queued) {
+      entry.resolveSent(false);
+      entry.resolveAck(false);
+    }
   }
 
   private buildSessionPayload(): Record<string, unknown> {
@@ -339,6 +462,20 @@ export class OpenAICompatibleProvider extends BaseRealtimeProvider {
 
   private handleEvent(event: Record<string, any>): void {
     switch (event.type) {
+      case 'session.updated': {
+        // Only post-handshake acks reach here (connect consumes its own).
+        // With serialization there is at most one update in flight, so this
+        // ack belongs to it; after a timeout desync there is none and any
+        // late ack is deliberately ignored.
+        const entry = this.updateInFlight;
+        if (!entry) break;
+        this.updateInFlight = null;
+        if (entry.ackTimer) clearTimeout(entry.ackTimer);
+        if (entry.touchesVad) this.effectiveVadValue = entry.resolvedVad;
+        entry.resolveAck(true);
+        this.pumpUpdateQueue();
+        break;
+      }
       case 'response.created': {
         const responseId = event.response?.id ?? `resp_${Date.now()}`;
         this.currentResponseId = responseId;

@@ -9,15 +9,18 @@ import { afterEach, describe, expect, it } from 'vitest';
 import * as z from 'zod';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Agent } from '../agents/Agent.js';
+import { pcm16ToMulaw } from '../audio/mulaw.js';
 import { tool } from '../tools/tool.js';
 import { geminiLive } from '../gemini.js';
 import { FakeGeminiLive } from '../testing/FakeGeminiLive.js';
 import { FakeOpenAIServer } from '../testing/FakeOpenAIServer.js';
 import { FakeTwilioMediaStream } from '../testing/FakeTwilioMediaStream.js';
 import { OpenAICompatibleProvider } from '../providers/openai-compatible/OpenAICompatibleProvider.js';
-import { buildXaiSessionUpdate } from '../xai.js';
+import { buildXaiSessionUpdate, xaiRealtime } from '../xai.js';
 import { TwilioRealtimeBridge } from './TwilioRealtimeBridge.js';
 import type { SessionOptions } from './config.js';
+import type { VadSuggestionInfo } from './events.js';
+import type { VadAdjustment } from '../vad/NoiseAdaptiveVadController.js';
 
 async function waitFor(predicate: () => boolean, timeoutMs = 2000, what = 'condition'): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -46,6 +49,22 @@ const SESSION: Partial<SessionOptions> = {
   greeting: { mode: 'user-initiates' },
   vad: { type: 'server', silenceDurationMs: 700, prefixPaddingMs: 300, threshold: 0.6 },
 };
+
+/** 20 ms base64 μ-law frames of a 440 Hz tone at ≈ −30 dBFS (above the −45 trigger). */
+function noiseFrames(ms: number): string[] {
+  const frames: string[] = [];
+  for (let start = 0; start < ms; start += 20) {
+    const pcm = new Int16Array(160);
+    for (let i = 0; i < 160; i++) {
+      pcm[i] = Math.round(1465 * Math.sin((2 * Math.PI * 440 * (start * 8 + i)) / 8000));
+    }
+    frames.push(Buffer.from(pcm16ToMulaw(pcm)).toString('base64'));
+  }
+  return frames;
+}
+
+/** Fast, deterministic noise-adaptation clocks (ms of audio; 20 ms frames). */
+const FAST_ADAPTIVE = { windowMs: 200, sustainMs: 100, cooldownMs: 300, maxSteps: 2 };
 
 describe('provider parity: one config surface', () => {
   let cleanup: Array<() => Promise<void>> = [];
@@ -185,6 +204,117 @@ describe('provider parity: one config surface', () => {
 
     const update = (await server.latest.waitForEvent('session.update')).session as any;
     expect(update.turn_detection.interrupt_response).toBeUndefined();
+  });
+
+  it('xAI noise adaptation escalates from the documented 0.85 default to 0.9 (never an invented 0.5)', async () => {
+    const server = await FakeOpenAIServer.start();
+    const bridge = new TwilioRealtimeBridge({
+      agent: AGENT,
+      provider: xaiRealtime({ apiKey: 'k', baseUrl: server.url }),
+      session: {
+        greeting: { mode: 'user-initiates' },
+        // Deliberately NO explicit threshold: the baseline must come from the
+        // xAI factory's vadTuning profile (0.85, range 0.1–0.9) — an assumed
+        // OpenAI-style 0.5 would LOWER xAI's threshold instead of raising it.
+        vad: { type: 'server', silenceDurationMs: 700 },
+        noiseAdaptiveVad: FAST_ADAPTIVE,
+      },
+    });
+    cleanup.push(async () => {
+      await bridge.close();
+      await server.close();
+    });
+    const fake = new FakeTwilioMediaStream();
+    bridge.handleConnection(fake);
+    fake.connect();
+    await waitFor(() => bridge.getSession(fake.callSid)?.state === 'active');
+    const session = bridge.getSession(fake.callSid)!;
+    const adjusted: VadAdjustment[] = [];
+    session.on('vad.adjusted', (info) => adjusted.push(info));
+
+    for (const frame of noiseFrames(400)) fake.sendMedia(frame);
+    await waitFor(() => adjusted.length === 1, 2000, 'xAI adjustment');
+    const update = server.latest.eventsOfType('session.update')[1]! as any;
+    // xAI shape: turn_detection at the session root; 0.85 + 0.1 clamps to the
+    // profile's 0.9 max. No interrupt_response (vadInterruptControl is off).
+    expect(update.session.turn_detection.threshold).toBe(0.9);
+    expect(update.session.turn_detection.interrupt_response).toBeUndefined();
+
+    // 0.85 → 0.9 was the only useful rung: more noise must never step again.
+    for (const frame of noiseFrames(800)) fake.sendMedia(frame);
+    await delay(60);
+    expect(server.latest.eventsOfType('session.update')).toHaveLength(2);
+  });
+
+  it('Gemini fallback (documented): noise adaptation is suggestion-only — no mid-session update exists', async () => {
+    const fakeGemini = new FakeGeminiLive();
+    const bridge = new TwilioRealtimeBridge({
+      agent: AGENT,
+      provider: geminiLive({ connector: fakeGemini.connector, model: 'gemini-test' }),
+      session: {
+        greeting: { mode: 'user-initiates' },
+        vad: { type: 'server', threshold: 0.6, silenceDurationMs: 700 },
+        noiseAdaptiveVad: FAST_ADAPTIVE,
+      },
+    });
+    cleanup.push(async () => bridge.close());
+    const fake = new FakeTwilioMediaStream();
+    bridge.handleConnection(fake);
+    fake.connect();
+    await waitFor(() => bridge.getSession(fake.callSid)?.state === 'active');
+    const session = bridge.getSession(fake.callSid)!;
+    const suggestions: VadSuggestionInfo[] = [];
+    const adjusted: VadAdjustment[] = [];
+    session.on('vad.suggestion', (info) => suggestions.push(info));
+    session.on('vad.adjusted', (info) => adjusted.push(info));
+
+    for (const frame of noiseFrames(600)) fake.sendMedia(frame);
+    await waitFor(() => suggestions.length === 1, 2000, 'gemini suggestion');
+    // Auto mode, but capabilities.sessionUpdate is false: suggestion only,
+    // carrying the Gemini-native analog (startSensitivity) for the app.
+    expect(suggestions[0]!.willAutoApply).toBe(false);
+    expect(suggestions[0]!.suggested.startSensitivity).toBe('low');
+
+    for (const frame of noiseFrames(1000)) fake.sendMedia(frame);
+    await delay(60);
+    expect(suggestions).toHaveLength(1); // latched — one suggestion per effective state
+    expect(adjusted).toHaveLength(0);
+    expect(fakeGemini.sessions).toHaveLength(1); // live config untouched, no reconnect
+  });
+
+  it('semantic VAD fallback (documented): eagerness is an end-of-turn latency control — never auto-applied', async () => {
+    const server = await FakeOpenAIServer.start();
+    const bridge = new TwilioRealtimeBridge({
+      agent: AGENT,
+      provider: ({ logger }) =>
+        new OpenAICompatibleProvider({ apiKey: 'k', model: 'gpt-realtime', baseUrl: server.url }, logger),
+      session: {
+        greeting: { mode: 'user-initiates' },
+        vad: { type: 'semantic', eagerness: 'medium' },
+        noiseAdaptiveVad: FAST_ADAPTIVE,
+      },
+    });
+    cleanup.push(async () => {
+      await bridge.close();
+      await server.close();
+    });
+    const fake = new FakeTwilioMediaStream();
+    bridge.handleConnection(fake);
+    fake.connect();
+    await waitFor(() => bridge.getSession(fake.callSid)?.state === 'active');
+    const session = bridge.getSession(fake.callSid)!;
+    const suggestions: VadSuggestionInfo[] = [];
+    session.on('vad.suggestion', (info) => suggestions.push(info));
+
+    for (const frame of noiseFrames(600)) fake.sendMedia(frame);
+    await waitFor(() => suggestions.length === 1, 2000, 'semantic suggestion');
+    expect(suggestions[0]!.autoApplicable).toBe(false); // policy, not a runtime gate
+    expect(suggestions[0]!.willAutoApply).toBe(false);
+    expect(suggestions[0]!.suggested).toMatchObject({ type: 'semantic', eagerness: 'low' });
+
+    await delay(60);
+    // Even in auto mode the session config was never touched.
+    expect(server.latest.eventsOfType('session.update')).toHaveLength(1);
   });
 
   it('greeting user-initiates: neither provider gets an unsolicited response trigger', async () => {

@@ -30,6 +30,7 @@ export type {
   CallStartedInfo,
   ToolRunInfo,
   ApprovalRequestInfo,
+  VadSuggestionInfo,
 } from './bridge/events.js';
 
 // Agents
@@ -82,9 +83,10 @@ export {
   type ProviderToolSchema,
   type SendTextOptions,
   type SendToolResultOptions,
+  type SessionUpdateOptions,
   type VadConfig,
 } from './providers/base/BaseRealtimeProvider.js';
-export type { ProviderCapabilities } from './providers/base/capabilities.js';
+export type { ProviderCapabilities, VadTuningProfile } from './providers/base/capabilities.js';
 export type {
   ProviderEvents,
   ProviderAudioDelta,
@@ -105,6 +107,14 @@ export {
   type InterruptionDecision,
   type InterruptionBlockCause,
 } from './interruption/InterruptionController.js';
+
+// Noise-adaptive VAD
+export {
+  NoiseAdaptiveVadController,
+  type NoiseAdaptiveVadOptions,
+  type VadAdjustment,
+  type VadNoiseMetrics,
+} from './vad/NoiseAdaptiveVadController.js';
 
 // Playback
 export { PlaybackTracker, type MarkEchoResult } from './playback/PlaybackTracker.js';

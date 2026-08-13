@@ -2,6 +2,7 @@ import type { Agent } from '../agents/Agent.js';
 import type { ProviderUsage } from '../providers/base/events.js';
 import type { TranscriptEntry } from '../session/transcript.js';
 import type { UsageInfo } from '../session/usage.js';
+import type { VadAdjustment } from '../vad/NoiseAdaptiveVadController.js';
 import type { CallSession } from './CallSession.js';
 import type { CallEndReason } from './state.js';
 
@@ -33,6 +34,14 @@ export interface ApprovalRequestInfo {
   agentId: string;
   expiresAtMs: number;
 }
+
+/**
+ * A noise-adaptive VAD suggestion. `autoApplicable` is policy ("is this kind
+ * of change safe to auto-apply?"); `willAutoApply` is runtime — false in
+ * suggest mode or when the provider has no mid-session update, even for an
+ * auto-applicable change.
+ */
+export type VadSuggestionInfo = VadAdjustment & { willAutoApply: boolean };
 
 // No `extends Record<string, ...>` here: an index signature would widen
 // `keyof` to `string` and let misspelled event names compile silently.
@@ -70,6 +79,11 @@ export interface SessionEventMap {
 
   interruption: (info: { responseId: string; playedMs: number }) => void;
   'interruption.blocked': (info: { cause: string }) => void;
+
+  /** Sustained background noise detected; an escalation is recommended (fires in both modes). */
+  'vad.suggestion': (info: VadSuggestionInfo) => void;
+  /** The escalation was applied AND acknowledged by the provider (auto mode only). */
+  'vad.adjusted': (info: VadAdjustment) => void;
 
   'background_audio.started': (info: { preset?: string }) => void;
   'background_audio.stopped': (info: { preset?: string }) => void;

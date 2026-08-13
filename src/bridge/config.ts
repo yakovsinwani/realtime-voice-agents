@@ -2,6 +2,7 @@ import type { IncomingMessage } from 'node:http';
 import type { Agent } from '../agents/Agent.js';
 import type { BackgroundAudioOptions, BackgroundAudioSpec } from '../audio/background/presets.js';
 import type { InterruptionSettings } from '../interruption/InterruptionController.js';
+import type { NoiseAdaptiveVadOptions } from '../vad/NoiseAdaptiveVadController.js';
 import type { Logger } from '../logging/logger.js';
 import type { ProviderFactory, VadConfig } from '../providers/base/BaseRealtimeProvider.js';
 import type { ReconnectPolicy } from '../providers/base/reconnect.js';
@@ -84,6 +85,14 @@ export interface SessionOptions {
   hangup: HangupOptions;
   /** Normalized VAD, mapped to the provider's native config. */
   vad?: VadConfig | null;
+  /**
+   * Opt-in noise-adaptive VAD escalation: analyze inbound caller audio and,
+   * on sustained background noise, raise turn-detection settings mid-call
+   * (auto-applied where the provider supports acknowledged session updates;
+   * suggestion events otherwise). Set `{}` to enable with defaults. Enabling
+   * this also serializes ALL mid-call session updates for the session.
+   */
+  noiseAdaptiveVad?: NoiseAdaptiveVadOptions;
   /**
    * `afterPlayback` (default): tool results wait until current agent audio
    * finishes playing. `immediate`: send as soon as the tool completes.

@@ -9,6 +9,12 @@ export {
   mulawBytesToMs,
   base64ByteLength,
 } from './mulaw.js';
+export {
+  NOISE_DBFS_FLOOR,
+  NoiseFloorEstimator,
+  type NoiseFloorEstimatorOptions,
+  mulawFrameDbfs,
+} from './noise.js';
 export { Resampler, type ResamplerOptions } from './resampler.js';
 export { InboundTranscoder, OutboundTranscoder } from './transcode.js';
 export { scaleMulaw, fadeMulaw } from './gain.js';
