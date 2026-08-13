@@ -1,4 +1,20 @@
 /**
+ * The provider's server-VAD tuning envelope. Declared by provider factories
+ * (never by the generic OpenAI-compatible base — an arbitrary compatible
+ * service must not silently inherit OpenAI's defaults). Noise-adaptive VAD
+ * refuses to invent a threshold baseline: absent both this profile and an
+ * explicit configured threshold, the numeric ladder stays unavailable.
+ */
+export interface VadTuningProfile {
+  /** The provider's effective server-VAD threshold when none is configured. */
+  defaultServerThreshold?: number;
+  /** Lowest threshold the provider accepts (clamp target). */
+  minServerThreshold?: number;
+  /** Highest threshold the provider accepts (clamp target). */
+  maxServerThreshold?: number;
+}
+
+/**
  * Capability flags per provider. The engine branches on these — never on a
  * provider's name — so new providers slot in without touching session logic.
  */
@@ -24,4 +40,9 @@ export interface ProviderCapabilities {
    * Optional so existing third-party providers keep compiling (absent = false).
    */
   vadInterruptControl?: boolean;
+  /**
+   * Server-VAD threshold envelope for noise-adaptive tuning. Optional; absent
+   * means the provider declared none (see VadTuningProfile).
+   */
+  vadTuning?: VadTuningProfile;
 }

@@ -72,6 +72,13 @@ export function openaiRealtime(options: OpenAIRealtimeOptions = {}): ProviderFac
     extraSessionOptions: options.sessionOptions,
     connectTimeoutMs: options.connectTimeoutMs,
     providerName: 'openai',
+    capabilityOverrides: {
+      // OpenAI GA server_vad: threshold defaults to 0.5, range 0–1
+      // (platform.openai.com/docs/guides/realtime-vad). Declared here rather
+      // than in the generic compatible provider so other OpenAI-compatible
+      // services don't silently inherit OpenAI's envelope.
+      vadTuning: { defaultServerThreshold: 0.5, minServerThreshold: 0, maxServerThreshold: 1 },
+    },
   };
   return ({ logger }) => {
     const provider = new OpenAICompatibleProvider(config, logger);

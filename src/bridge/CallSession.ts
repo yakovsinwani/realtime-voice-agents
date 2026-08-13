@@ -22,7 +22,12 @@ import type {
   BaseRealtimeProvider,
   ProviderFactory,
   ProviderSessionInit,
+  VadConfig,
 } from '../providers/base/BaseRealtimeProvider.js';
+import {
+  NoiseAdaptiveVadController,
+  type VadAdjustment,
+} from '../vad/NoiseAdaptiveVadController.js';
 import { delayForAttempt } from '../providers/base/reconnect.js';
 import type { ProviderToolCall } from '../providers/base/events.js';
 import type { CallSnapshot } from '../session/snapshot.js';
@@ -44,6 +49,13 @@ import type { SessionEventMap } from './events.js';
 import type { CallEndReason, CallState } from './state.js';
 
 const MAX_BUFFERED_INBOUND_FRAMES = 250; // ~5s of 20ms frames
+
+/**
+ * Cap on the noise meter's caller-speech exclusion: Gemini never emits a
+ * speech-stopped event, and phantom speech starts on a noisy line must not
+ * latch the meter off forever.
+ */
+const MAX_SPEECH_EXCLUSION_MS = 15_000;
 
 export interface CallSessionDeps {
   transport: TwilioMediaTransport;
@@ -134,6 +146,22 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
   /** Pre-synthesized greeting playout state. */
   private pregreeting: { text: string; durationMs: number; played: boolean } | null = null;
 
+  /** Noise-adaptive VAD (opt-in); built after connect from the provider's ACKed config. */
+  private noiseVad: NoiseAdaptiveVadController | null = null;
+  /**
+   * DESIRED turn-detection override — drives reconnect/handoff rebuilds via
+   * buildProviderInit. Distinct from the provider's ACKed effective state:
+   * manual updateVad() promotes it immediately (user intent survives network
+   * failures); adaptive applies promote it only after the provider's ack.
+   */
+  private vadOverride: VadConfig | null | undefined = undefined;
+  /** VAD mutations in flight (manual AND adaptive); proposals drop while > 0. */
+  private vadOpsInFlight = 0;
+  /** Bumped by every updateVad(); a stale revision means an adaptive apply was superseded. */
+  private vadRevision = 0;
+  private userSpeechActive = false;
+  private userSpeechStartedAtMs = 0;
+
   constructor(deps: CallSessionDeps) {
     super();
     this.deps = deps;
@@ -209,6 +237,20 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       to: this.callInfo.to,
       customParameters: this.callInfo.customParameters,
     });
+    // Noise-adaptive VAD: the ladder's baseline is what the provider actually
+    // ACKed at connect (provider-level defaults and the barge-in injection
+    // included) — never what the session options merely intended. An explicit
+    // vad: null means turn detection is off and there is nothing to adapt.
+    if (this.deps.options.noiseAdaptiveVad && this.deps.options.vad !== null) {
+      this.noiseVad = new NoiseAdaptiveVadController(
+        this.deps.options.noiseAdaptiveVad,
+        this.provider!.getEffectiveVad(),
+        this.provider!.capabilities.vadTuning,
+      );
+      if (this.noiseVad.exhausted) {
+        this.log.warn('noiseAdaptiveVad enabled but the effective VAD config leaves no escalation room');
+      }
+    }
     // Seed the pre-played greeting into the model's context so it continues
     // from it instead of greeting twice (second of three no-re-greet layers;
     // the instruction reinforcement lives in buildProviderInit).
@@ -235,6 +277,37 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
   async updateInstructions(instructions: string): Promise<void> {
     await this.provider?.updateSession({ instructions });
+  }
+
+  /**
+   * Replace the session's turn-detection config mid-call. The value is the
+   * new DESIRED state: it survives reconnects and handoffs, and the
+   * noise-adaptive ladder (when enabled) rebases onto it — future escalation
+   * is relative to this config, never below it. `null` disables turn
+   * detection AND suspends noise adaptation (adaptation never re-enables VAD
+   * on its own); a later non-null call re-enables both.
+   *
+   * Returns true when the live session applied it — provider-acknowledged
+   * when `noiseAdaptiveVad` is configured (serialized updates), best-effort
+   * "sent" otherwise. False when it could not be applied live (no provider,
+   * call ended, no sessionUpdate capability, or the ack timed out — the
+   * resulting reconnect then applies the stored config).
+   */
+  async updateVad(vad: VadConfig | null): Promise<boolean> {
+    this.vadRevision++; // supersede any in-flight adaptive apply
+    this.vadOpsInFlight++; // and block new adaptive applies while this runs
+    try {
+      this.vadOverride = vad; // manual intent persists even through failures
+      if (!this.provider || this.stateValue === 'ended') return false;
+      if (!this.provider.capabilities.sessionUpdate) {
+        this.log.warn('updateVad: provider has no mid-session update — stored for the next reconnect');
+        return false;
+      }
+      return (await this.provider.updateSession({ vad }, { awaitAck: true })) === true;
+    } finally {
+      this.noiseVad?.rebase(vad);
+      this.vadOpsInFlight--;
+    }
   }
 
   /** Manual barge-in: stop the agent mid-sentence. */
@@ -362,11 +435,16 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
           ? `\n\nYou already opened the call by saying: "${this.pregreeting.text}". Do not greet again — continue the conversation from there.`
           : ''),
       voice: this.activeAgentValue.voice,
-      vad: this.deps.options.vad,
+      // A runtime override (updateVad / committed noise adaptation) survives
+      // reconnects and handoff-reconnects — this rebuild is their vehicle.
+      vad: this.vadOverride !== undefined ? this.vadOverride : this.deps.options.vad,
       // The guard must be able to VETO an interruption, which requires the
       // server not to auto-cancel on speech onset. Capability-gated inside
       // each provider; explicit vad.interruptResponse wins.
       bridgeOwnsInterruptions: true,
+      // Noise adaptation needs acknowledged, serialized session updates;
+      // without it the legacy fire-and-forget behavior stays untouched.
+      serializedSessionUpdates: this.deps.options.noiseAdaptiveVad !== undefined,
       tools: [...this.toolset.values()].map((tool) => {
         const decorated = decorateTool(tool, this.middlewares);
         return {
@@ -486,12 +564,15 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     });
 
     provider.on('userSpeechStarted', () => {
+      this.userSpeechActive = true;
+      this.userSpeechStartedAtMs = Date.now();
       this.clearIdleTimer();
       this.nudgeCount = 0;
       this.emit('user.speech.started');
       this.handleBargeIn();
     });
     provider.on('userSpeechStopped', () => {
+      this.userSpeechActive = false;
       // Their blocked turn is now VAD-committed server-side; answer it once
       // the protected playback finishes.
       if (this.blockedUserTurn === 'speaking') this.blockedUserTurn = 'committed';
@@ -518,6 +599,21 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
   private handleInboundMedia(payload: string): void {
     if (this.stateValue === 'ended' || this.stateValue === 'ending') return;
+    // The noise meter taps BEFORE the drop-guards below: rate-limiter
+    // suspension and first-turn deafness are consequences of noise, so a
+    // meter behind them would go blind exactly when it matters. Caller
+    // speech, agent playback (speakerphone bleed), and the pre-greeting are
+    // excluded from the floor estimate instead — they are sound, not line
+    // noise. `flushInboundBuffer` bypasses this tap, so buffered frames are
+    // metered exactly once, at arrival.
+    if (this.noiseVad) {
+      const excluded =
+        this.isUserSpeechExcluded() ||
+        this.tracker.isPlaybackActive() ||
+        (this.pregreeting !== null && !this.pregreeting.played);
+      const proposal = this.noiseVad.onInboundFrame(payload, excluded);
+      if (proposal) this.handleVadProposal(proposal);
+    }
     // While the pre-synthesized greeting is playing, the provider must not
     // hear the line: server-side VAD would treat greeting bleed/noise as a
     // barge-in on a turn it never generated.
@@ -539,6 +635,63 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     if (!this.provider?.isConnected) return;
     for (const payload of this.inboundBuffer) this.provider.sendAudio(payload);
     this.inboundBuffer = [];
+  }
+
+  // ---- noise-adaptive VAD ---------------------------------------------------
+
+  /** Caller speech is excluded from the noise floor, capped so a missing
+   * speech-stopped event (Gemini) can't latch the meter off forever. */
+  private isUserSpeechExcluded(): boolean {
+    return this.userSpeechActive && Date.now() - this.userSpeechStartedAtMs < MAX_SPEECH_EXCLUSION_MS;
+  }
+
+  private handleVadProposal(proposal: VadAdjustment): void {
+    if (this.vadOpsInFlight > 0) return; // one VAD mutation at a time (manual included)
+    const mode = this.deps.options.noiseAdaptiveVad?.mode ?? 'auto';
+    const willAutoApply =
+      mode === 'auto' && proposal.autoApplicable && this.provider?.capabilities.sessionUpdate === true;
+    this.emit('vad.suggestion', { ...proposal, willAutoApply });
+    if (!willAutoApply) {
+      // Suggestion-only: suggest mode, a rung that is never auto-applied
+      // (semantic/sensitivity), or no mid-session update on this provider
+      // (the documented Gemini fallback). Fires once per effective state;
+      // the effective config is NOT moved — a suggestion is not reality.
+      this.noiseVad?.markSuggested(proposal);
+      return;
+    }
+    this.vadOpsInFlight++;
+    const revisionAtPropose = this.vadRevision;
+    void this.applyAdaptiveVadUpdate(proposal, revisionAtPropose)
+      .catch((error) => {
+        this.noiseVad?.defer();
+        this.log.warn('noise-adaptive VAD apply failed', { error: String(error) });
+      })
+      .finally(() => {
+        this.vadOpsInFlight--;
+      });
+  }
+
+  /**
+   * Adaptive applies promote NOTHING until the provider ACKs: a timed-out
+   * update must not leak into vadOverride, or the desync-reconnect would
+   * apply a config the controller never committed (dual truth). Contrast
+   * with updateVad(), where the user's declared intent persists regardless.
+   */
+  private async applyAdaptiveVadUpdate(proposal: VadAdjustment, revisionAtPropose: number): Promise<void> {
+    const provider = this.provider;
+    if (!provider || this.stateValue === 'ended') {
+      this.noiseVad?.defer();
+      return;
+    }
+    const acked = await provider.updateSession({ vad: proposal.suggested }, { awaitAck: true });
+    if (revisionAtPropose !== this.vadRevision) return; // superseded by updateVad()
+    if (acked === true) {
+      this.vadOverride = proposal.suggested;
+      this.noiseVad?.commitApplied(proposal);
+      this.emit('vad.adjusted', proposal);
+    } else {
+      this.noiseVad?.defer();
+    }
   }
 
   // ---- playback / marks ----------------------------------------------------

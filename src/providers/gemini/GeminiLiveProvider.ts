@@ -201,6 +201,10 @@ export class GeminiLiveProvider extends BaseRealtimeProvider {
         throw setupError ?? (error instanceof Error ? error : new Error(String(error)));
       }
       await setupDone;
+      // Setup complete = the connect-time config (incl. VAD) is live. Gemini
+      // has no mid-session updates, so this stays the ACKed truth for the
+      // whole connection.
+      this.effectiveVadValue = init.vad !== undefined ? init.vad : this.config.defaultVad;
     } finally {
       clearTimeout(timer);
     }

@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { setTimeout as delay } from 'node:timers/promises';
 import { FakeOpenAIServer } from '../../testing/FakeOpenAIServer.js';
-import { OpenAICompatibleProvider } from './OpenAICompatibleProvider.js';
+import {
+  OpenAICompatibleProvider,
+  type OpenAICompatibleProviderConfig,
+} from './OpenAICompatibleProvider.js';
 import type { ProviderSessionInit } from '../base/BaseRealtimeProvider.js';
 
 const INIT: ProviderSessionInit = {
@@ -275,5 +278,157 @@ describe('OpenAICompatibleProvider against FakeOpenAIServer', () => {
     await expect(failing.connect(INIT)).rejects.toThrow('not ready within 300ms');
     await failing.close();
     await strict.close();
+  });
+});
+
+describe('serialized session updates + ACKed effectiveVad', () => {
+  let server: FakeOpenAIServer;
+  const providers: OpenAICompatibleProvider[] = [];
+
+  const makeProvider = (config: Partial<OpenAICompatibleProviderConfig> = {}) => {
+    const provider = new OpenAICompatibleProvider({
+      apiKey: 'test-key',
+      model: 'gpt-realtime',
+      baseUrl: server.url,
+      ...config,
+    });
+    providers.push(provider);
+    return provider;
+  };
+
+  /** connect() resolves only on session.updated — ack the handshake by hand. */
+  const connectManualAck = async (provider: OpenAICompatibleProvider, init: ProviderSessionInit) => {
+    const pending = provider.connect(init);
+    const conn = await server.waitForConnection();
+    await conn.waitForEvent('session.update');
+    conn.send({ type: 'session.updated', session: {} });
+    await pending;
+    return conn;
+  };
+
+  const vadOf = (frame: Record<string, any>) => (frame.session as any)?.audio?.input?.turn_detection;
+
+  beforeEach(async () => {
+    server = await FakeOpenAIServer.start({ autoAckSessionUpdate: false });
+  });
+
+  afterEach(async () => {
+    for (const provider of providers.splice(0)) await provider.close();
+    await server.close();
+  });
+
+  it('re-injects interrupt_response: false on a vad patch (bridge-owned barge-in survives updateSession)', async () => {
+    const provider = makeProvider();
+    const conn = await connectManualAck(provider, { ...INIT, bridgeOwnsInterruptions: true });
+    void provider.updateSession({ vad: { type: 'server', threshold: 0.6 } });
+    const update = await conn.waitForEvent(
+      (f) => f.type === 'session.update' && vadOf(f)?.threshold === 0.6,
+    );
+    expect(vadOf(update)).toEqual({ type: 'server_vad', threshold: 0.6, interrupt_response: false });
+  });
+
+  it('lets an explicit interruptResponse in the vad patch win over the injection', async () => {
+    const provider = makeProvider();
+    const conn = await connectManualAck(provider, { ...INIT, bridgeOwnsInterruptions: true });
+    void provider.updateSession({ vad: { type: 'server', threshold: 0.6, interruptResponse: true } });
+    const update = await conn.waitForEvent(
+      (f) => f.type === 'session.update' && vadOf(f)?.threshold === 0.6,
+    );
+    expect(vadOf(update).interrupt_response).toBe(true);
+  });
+
+  it('getEffectiveVad reflects the ACKed connect config, incl. provider defaultVad + injection', async () => {
+    const provider = makeProvider({ defaultVad: { type: 'server', threshold: 0.7 } });
+    expect(provider.getEffectiveVad()).toBeUndefined();
+    await connectManualAck(provider, { ...INIT, bridgeOwnsInterruptions: true });
+    expect(provider.getEffectiveVad()).toEqual({
+      interruptResponse: false,
+      type: 'server',
+      threshold: 0.7,
+    });
+  });
+
+  it('moves effectiveVad only when the update is acknowledged', async () => {
+    const provider = makeProvider();
+    const conn = await connectManualAck(provider, {
+      ...INIT,
+      vad: { type: 'server', threshold: 0.5 },
+      serializedSessionUpdates: true,
+    });
+    const acked = provider.updateSession({ vad: { type: 'server', threshold: 0.9 } }, { awaitAck: true });
+    await conn.waitForEvent((f) => f.type === 'session.update' && vadOf(f)?.threshold === 0.9);
+    // Sent but not acknowledged: the effective truth is still the old config.
+    expect(provider.getEffectiveVad()).toEqual({ type: 'server', threshold: 0.5 });
+    conn.send({ type: 'session.updated', session: {} });
+    await expect(acked).resolves.toBe(true);
+    expect(provider.getEffectiveVad()).toEqual({ type: 'server', threshold: 0.9 });
+  });
+
+  it('without serializedSessionUpdates, updates hit the wire immediately (legacy behavior pinned)', async () => {
+    const provider = makeProvider();
+    const conn = await connectManualAck(provider, INIT);
+    await provider.updateSession({ instructions: 'A' });
+    await provider.updateSession({ instructions: 'B' });
+    await conn.waitForEvent((f) => f.type === 'session.update' && f.session.instructions === 'B');
+    // Handshake + A + B all on the wire with zero acks granted.
+    expect(conn.eventsOfType('session.update')).toHaveLength(3);
+  });
+
+  it('serializes updates, snapshots each payload at enqueue, and acks per entry (A/B/C isolation)', async () => {
+    const provider = makeProvider();
+    const conn = await connectManualAck(provider, {
+      ...INIT,
+      vad: { type: 'server', threshold: 0.5 },
+      serializedSessionUpdates: true,
+    });
+    const a = provider.updateSession({ instructions: 'A' }, { awaitAck: true });
+    const b = provider.updateSession({ vad: { type: 'server', threshold: 0.6 } }, { awaitAck: true });
+    const c = provider.updateSession({ vad: { type: 'server', threshold: 0.8 } }, { awaitAck: true });
+
+    await conn.waitForEvent((f) => f.type === 'session.update' && f.session.instructions === 'A');
+    // Only A is in flight; B and C wait for acks.
+    expect(conn.eventsOfType('session.update')).toHaveLength(2);
+
+    conn.send({ type: 'session.updated', session: {} }); // ack A
+    await expect(a).resolves.toBe(true);
+    // B's payload was snapshotted before C merged: 0.6 on the wire, not 0.8.
+    // (A crooked snapshot would send 0.8 here and this wait would time out.)
+    await conn.waitForEvent((f) => f.type === 'session.update' && vadOf(f)?.threshold === 0.6);
+    expect(
+      conn.eventsOfType('session.update').filter((f) => vadOf(f)?.threshold === 0.8),
+    ).toHaveLength(0);
+
+    conn.send({ type: 'session.updated', session: {} }); // ack B
+    await expect(b).resolves.toBe(true);
+    expect(provider.getEffectiveVad()).toEqual({ type: 'server', threshold: 0.6 });
+
+    await conn.waitForEvent((f) => f.type === 'session.update' && vadOf(f)?.threshold === 0.8);
+    conn.send({ type: 'session.updated', session: {} }); // ack C
+    await expect(c).resolves.toBe(true);
+    expect(provider.getEffectiveVad()).toEqual({ type: 'server', threshold: 0.8 });
+  });
+
+  it('desyncs the connection when an ack times out: resolve false, drop the socket', async () => {
+    const provider = makeProvider({ sessionUpdateAckTimeoutMs: 120 });
+    const conn = await connectManualAck(provider, { ...INIT, serializedSessionUpdates: true });
+    const closes: Array<{ retriable: boolean }> = [];
+    provider.on('close', (info) => closes.push(info));
+    const acked = provider.updateSession({ vad: { type: 'server', threshold: 0.9 } }, { awaitAck: true });
+    await expect(acked).resolves.toBe(false);
+    await waitFor(() => closes.length === 1, 2000, 'desync close');
+    expect(closes[0]!.retriable).toBe(true);
+    // The unacked value was never promoted to effective truth.
+    expect(provider.getEffectiveVad()).toBeUndefined();
+    void conn;
+  });
+
+  it('settles queued updates as not-acked when the socket drops', async () => {
+    const provider = makeProvider();
+    const conn = await connectManualAck(provider, { ...INIT, serializedSessionUpdates: true });
+    const a = provider.updateSession({ instructions: 'A' }, { awaitAck: true });
+    const b = provider.updateSession({ instructions: 'B' }, { awaitAck: true });
+    conn.drop(1011);
+    await expect(a).resolves.toBe(false);
+    await expect(b).resolves.toBe(false);
   });
 });

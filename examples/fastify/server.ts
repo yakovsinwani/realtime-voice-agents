@@ -98,7 +98,7 @@ const bridge = new TwilioRealtimeBridge({
     greeting: { mode: 'agent-initiates' },
     interruptions: {
       enabled: true,
-      preventInterruptionOnFirstSentence: true,
+      guardDurationMs: 1500,
       rateLimit: {
         windowMs: 30_000,
         threshold: 4,

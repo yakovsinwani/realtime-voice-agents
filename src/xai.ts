@@ -126,6 +126,10 @@ export function xaiRealtime(options: XaiRealtimeOptions = {}): ProviderFactory {
       // fallback: server-side auto-interrupt stays on, so the interruption
       // guard protects only already-buffered Twilio audio (see parity tests).
       vadInterruptControl: false,
+      // xAI Voice Agent server VAD: threshold defaults to 0.85, range 0.1–0.9
+      // (docs.x.ai voice-agent reference). NOT OpenAI's 0.5 — a noise-adaptive
+      // ladder that assumed 0.5 here would LOWER the threshold.
+      vadTuning: { defaultServerThreshold: 0.85, minServerThreshold: 0.1, maxServerThreshold: 0.9 },
     },
   };
   return ({ logger }) => new OpenAICompatibleProvider(config, logger);
