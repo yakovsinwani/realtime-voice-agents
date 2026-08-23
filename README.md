@@ -116,12 +116,13 @@ const bridge = new TwilioRealtimeBridge({
 });
 ```
 
-- **Connect-time only.** A provider that fails to answer (rejected key, no credits, refused socket, connect timeout) is dropped and the next one is tried immediately — no backoff between attempts. Once a provider answers, the call stays with it: mid-call reconnects reuse the same provider (per the `session.reconnect` policy), and a mid-call death past that budget fails the call rather than switching voices mid-conversation.
+- **Covers the real failure modes.** A missing API key (the factories defer their credential check to call time precisely so the chain can absorb it), an expired/revoked key (HTTP 401), exhausted credits/quota (403/429), a provider internal error (5xx or a dropped socket), and a hung endpoint (connect timeout) all walk the chain — anything that keeps a provider from coming up.
+- **Connect-time only.** A dead provider is dropped and the next one is tried immediately — no backoff between attempts. Once a provider answers, the call stays with it: mid-call reconnects reuse the same provider (per the `session.reconnect` policy), and a mid-call death past that budget fails the call rather than switching voices mid-conversation.
 - **Observable.** Each advance emits `provider.fallback` (`{ from, to, error }`) on the session — count these to alarm on a degraded primary.
 - **Voices don't cross vendors.** Configure the voice per factory (`openaiRealtime({ voice: 'marin' })`, `xaiRealtime({ voice: 'eve' })`) rather than on the `Agent` — an OpenAI voice name would fail the xAI/Gemini connect and the chain would skip past a healthy provider.
 - **Latency.** Each dead provider costs up to its `connectTimeoutMs` (default 10s) before the next is tried — set a tighter one on the primary if its endpoint tends to hang rather than refuse. A [pre-synthesized greeting](#pre-synthesized-greeting-15s-to-first-word) bursts onto the line before any handshake, so the caller hears a voice while the chain walks.
 
-Testing it: `FakeOpenAIServer.start({ refuseConnections: true })` gives you a provider that is "down" (flip `server.refuseConnections` at runtime to script recoveries) — see `src/bridge/fallback.test.ts` for ready-made scenarios.
+Testing it: `FakeOpenAIServer.start({ refuseConnections: true })` gives you a provider that is "down", and `{ rejectUpgrade: { status: 401, body: 'invalid_api_key' } }` one that rejects like a real auth/quota failure (both flippable at runtime to script recoveries) — see `src/bridge/fallback.test.ts` for ready-made scenarios.
 
 ## Tools: Zod schemas + execution strategies
 

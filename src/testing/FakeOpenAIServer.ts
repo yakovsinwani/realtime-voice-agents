@@ -23,6 +23,14 @@ export interface FakeOpenAIServerOptions {
    * `refusedConnections` and never appear in `connections`.
    */
   refuseConnections?: boolean;
+  /**
+   * Reject the HTTP upgrade itself with this status + body — how real
+   * providers surface an invalid/expired key (401), exhausted credits
+   * (403/429), or an internal error (5xx). Mutable at runtime via the
+   * server's `rejectUpgrade` field (null re-accepts); rejections are counted
+   * in `rejectedUpgrades` and never appear in `connections`.
+   */
+  rejectUpgrade?: { status: number; body?: string };
 }
 
 export interface FakeAudioResponseOptions {
@@ -176,6 +184,10 @@ export class FakeOpenAIServer {
   refuseConnections: boolean;
   /** Sockets closed by `refuseConnections` before a session was created. */
   refusedConnections = 0;
+  /** Set at runtime to start rejecting HTTP upgrades; null re-accepts. */
+  rejectUpgrade: { status: number; body?: string } | null;
+  /** Upgrades rejected by `rejectUpgrade`. */
+  rejectedUpgrades = 0;
   private readonly wss: WebSocketServer;
   private readonly options: FakeOpenAIServerOptions;
   readonly url: string;
@@ -185,6 +197,7 @@ export class FakeOpenAIServer {
     this.url = url;
     this.options = options;
     this.refuseConnections = options.refuseConnections ?? false;
+    this.rejectUpgrade = options.rejectUpgrade ?? null;
     wss.on('connection', (socket, request) => {
       if (this.refuseConnections) {
         this.refusedConnections++;
@@ -210,14 +223,35 @@ export class FakeOpenAIServer {
   }
 
   static async start(options: FakeOpenAIServerOptions = {}): Promise<FakeOpenAIServer> {
-    const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+    // verifyClient must consult the (mutable) instance, which can only exist
+    // after the wss it wraps — hence the holder. No client can connect before
+    // start() returns the instance, so the holder is always populated in time.
+    const holder: { server?: FakeOpenAIServer } = {};
+    const wss = new WebSocketServer({
+      port: 0,
+      host: '127.0.0.1',
+      verifyClient: (
+        _info: unknown,
+        done: (ok: boolean, code?: number, message?: string) => void,
+      ) => {
+        const reject = holder.server?.rejectUpgrade;
+        if (reject) {
+          holder.server!.rejectedUpgrades++;
+          done(false, reject.status, reject.body ?? 'rejected by fake server');
+          return;
+        }
+        done(true);
+      },
+    });
     await new Promise<void>((resolve, reject) => {
       wss.once('listening', resolve);
       wss.once('error', reject);
     });
     const address = wss.address();
     if (typeof address === 'string' || address === null) throw new Error('no server address');
-    return new FakeOpenAIServer(wss, `ws://127.0.0.1:${address.port}`, options);
+    const server = new FakeOpenAIServer(wss, `ws://127.0.0.1:${address.port}`, options);
+    holder.server = server;
+    return server;
   }
 
   get latest(): FakeOpenAIConnection {

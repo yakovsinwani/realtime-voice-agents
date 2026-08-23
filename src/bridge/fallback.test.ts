@@ -9,7 +9,8 @@
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { Agent } from '../agents/Agent.js';
-import { FakeOpenAIServer } from '../testing/FakeOpenAIServer.js';
+import { openaiRealtime, OPENAI_KEY_ENV_VARS } from '../openai.js';
+import { FakeOpenAIServer, type FakeOpenAIServerOptions } from '../testing/FakeOpenAIServer.js';
 import { FakeTwilioMediaStream, mulawSilenceBase64 } from '../testing/FakeTwilioMediaStream.js';
 import { OpenAICompatibleProvider } from '../providers/openai-compatible/OpenAICompatibleProvider.js';
 import type { ProviderFactory } from '../providers/base/BaseRealtimeProvider.js';
@@ -40,7 +41,7 @@ describe('provider fallback chain (connect-time)', () => {
   let bridge: TwilioRealtimeBridge;
   let fake: FakeTwilioMediaStream;
 
-  const startServer = async (options: { refuseConnections?: boolean } = {}) => {
+  const startServer = async (options: FakeOpenAIServerOptions = {}) => {
     const server = await FakeOpenAIServer.start(options);
     servers.push(server);
     return server;
@@ -193,6 +194,53 @@ describe('provider fallback chain (connect-time)', () => {
     expect(ended).toEqual(['provider-failed']);
     expect(fallbacks).toHaveLength(0);
     expect(backup.connections).toHaveLength(0);
+  });
+
+  // How real providers surface an invalid/expired key, exhausted credits, and
+  // an internal error: an HTTP rejection of the WebSocket upgrade itself.
+  it.each([
+    [401, 'invalid_api_key (expired or revoked)'],
+    [403, 'insufficient_quota: credits exhausted'],
+    [500, 'internal_server_error'],
+  ])('falls back when the primary rejects the upgrade with HTTP %d', async (status, body) => {
+    const primary = await startServer({ rejectUpgrade: { status, body } });
+    const backup = await startServer();
+    bridge = makeBridge({
+      provider: providerFor(primary, 'primary'),
+      fallbacks: [providerFor(backup, 'backup')],
+    });
+    const { session, fallbacks } = await startCall();
+    await waitFor(() => session.state === 'active', 2000, 'active on the backup');
+
+    expect(primary.rejectedUpgrades).toBe(1);
+    expect(fallbacks).toHaveLength(1);
+    // The provider's actual verdict (status + body) travels in the event.
+    expect(String(fallbacks[0]!.error)).toContain(`HTTP ${status}`);
+    expect(String(fallbacks[0]!.error)).toContain(body);
+  });
+
+  it('missing API key: openaiRealtime() defers the failure to call time so the chain absorbs it', async () => {
+    const backup = await startServer();
+    const saved = OPENAI_KEY_ENV_VARS.map((name) => [name, process.env[name]] as const);
+    for (const name of OPENAI_KEY_ENV_VARS) delete process.env[name];
+    try {
+      // Must NOT throw here (config build time) — the chain could never be
+      // constructed otherwise.
+      bridge = makeBridge({
+        provider: openaiRealtime(),
+        fallbacks: [providerFor(backup, 'backup')],
+      });
+      const { session, fallbacks } = await startCall();
+      await waitFor(() => session.state === 'active', 2000, 'active on the backup');
+
+      expect(fallbacks).toHaveLength(1);
+      expect(fallbacks[0]!.to).toBe('backup');
+      expect(String(fallbacks[0]!.error)).toContain('apiKey missing');
+    } finally {
+      for (const [name, value] of saved) {
+        if (value !== undefined) process.env[name] = value;
+      }
+    }
   });
 
   it('skips a fallback whose factory throws and keeps walking the chain', async () => {
