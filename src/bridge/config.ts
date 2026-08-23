@@ -1,6 +1,7 @@
 import type { IncomingMessage } from 'node:http';
 import type { Agent } from '../agents/Agent.js';
 import type { BackgroundAudioOptions, BackgroundAudioSpec } from '../audio/background/presets.js';
+import type { KeypadOptions } from '../dtmf/KeypadCollector.js';
 import type { InterruptionSettings } from '../interruption/InterruptionController.js';
 import type { NoiseAdaptiveVadOptions } from '../vad/NoiseAdaptiveVadController.js';
 import type { Logger } from '../logging/logger.js';
@@ -93,6 +94,15 @@ export interface SessionOptions {
    * this also serializes ALL mid-call session updates for the session.
    */
   noiseAdaptiveVad?: NoiseAdaptiveVadOptions;
+  /**
+   * Opt-in keypad (DTMF) input: buffer keypresses into complete entries —
+   * `#` submits, `*` clears, `maxDigits` auto-submits, 4s of no keypresses
+   * flushes — stop the agent on every keypress, and inject each entry as a
+   * `[keypad] ...` user turn the model answers. Emits `keypad.entry` /
+   * `keypad.cleared`; the raw `dtmf` event keeps firing per key. Set `{}` to
+   * enable with defaults; unset = raw `dtmf` events only, as before.
+   */
+  keypad?: KeypadOptions;
   /**
    * `afterPlayback` (default): tool results wait until current agent audio
    * finishes playing. `immediate`: send as soon as the tool completes.

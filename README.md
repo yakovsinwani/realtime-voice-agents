@@ -270,9 +270,38 @@ session: { greeting: { mode: 'agent-initiates',
 
 Bundled presets (all synthesized, license-free, seamless loops): `elevator-jazz`, `lofi`, `keyboard-typing`, `thinking-hum`, `ringing` — or `{ custom: bufferOrPath }` with your own 8 kHz μ-law. Drift-corrected 20 ms pacing, refcounted across concurrent tools, ~1 s start delay so fast tools stay silent, fade in/out, 60 s failsafe, and instant preemption when real speech arrives. Manual control: `session.playBackgroundAudio('lofi')` / `stopBackgroundAudio()`.
 
+## Keypad input (DTMF, opt-in)
+
+Callers type an ID, a phone number, a confirmation code — Twilio delivers each key as its own `dtmf` frame, ~1s apart, and a model that sees ten fragments answers "I didn't get that" ten times. `keypad` turns keypresses into one entry: digits buffer, `#` submits, `*` clears, `maxDigits` auto-submits, 4s without a key flushes what's there (so the agent can say "that's only 7 digits — again, please"). Each keypress stops the agent mid-sentence (typing means "I'm answering"), and the entry reaches the model as a **user** turn — `[keypad] I typed on my phone keypad: 0541234567 — 10 digits. Digit by digit: 0 5 4 …` — that triggers the response answering it. A short note appended to the agent instructions tells the model what `[keypad]` messages are.
+
+```ts
+session: {
+  keypad: {},                              // {} = defaults below
+  // maxDigits: 9,                         // auto-submit at N digits (no # needed)
+  // interDigitTimeoutMs: 4000, submitKey: '#', clearKey: '*',
+  // interruptOnKeypress: true,            // false: the agent keeps talking while the caller types
+  // message: (entry) => string | false,   // wording of the injected user turn; false = events only
+  // clearMessage: string | false,         // what the model hears on *; false = nothing
+  // instructions: string | false,         // the appended note; false = your prompt says it
+}
+```
+
+Observe or take over with events and the `session.keypad` handle (`digits`, `clear()`, `submit()`):
+
+```ts
+session.on('keypad.entry', ({ digits, reason }) => { /* reason: 'submit' | 'timeout' | 'maxDigits' */ });
+session.on('keypad.cleared', ({ discarded }) => { /* caller pressed * */ });
+// Raw keypresses still fire per key — AFTER the collector consumed them, so the handle is current:
+session.on('dtmf', ({ digit }) => {
+  if (digit === '0' && session.keypad.digits === '0') { session.keypad.clear(); void session.transferTo(OPERATOR); }
+});
+```
+
+`message: false` keeps the collection and events but injects nothing — validate the entry yourself and `session.sendText(..., { role: 'user', triggerResponse: true })` what the model should hear. Role `user`, not `system`: a trailing system item is skipped by the response it triggers and only lands one response later (field-tested on xAI). Without `keypad` configured nothing changes: raw `dtmf` events only, as before. Letters A–D are ignored; the buffer dies with the call.
+
 ## Events (session)
 
-`call.started/ended/failed` · `provider.connected/fallback/reconnecting/reconnected/closed` · `agent.speech.started/ended` (generation) · **`playback.started/finished/interrupted`** (what the caller heard, mark-confirmed) · `user.speech.started/ended` · `transcript.user/agent` · `tool.started/completed/failed` · `tool.approval.required` · `agent.handoff` · `interruption` / `interruption.blocked` · `vad.suggestion` / `vad.adjusted` (noise-adaptive VAD) · `background_audio.started/stopped` · `dtmf` · `usage.updated` · `error`.
+`call.started/ended/failed` · `provider.connected/fallback/reconnecting/reconnected/closed` · `agent.speech.started/ended` (generation) · **`playback.started/finished/interrupted`** (what the caller heard, mark-confirmed) · `user.speech.started/ended` · `transcript.user/agent` · `tool.started/completed/failed` · `tool.approval.required` · `agent.handoff` · `interruption` / `interruption.blocked` · `vad.suggestion` / `vad.adjusted` (noise-adaptive VAD) · `background_audio.started/stopped` · `dtmf` (raw keypress) · `keypad.entry` / `keypad.cleared` (keypad input) · `usage.updated` · `error`.
 
 ```ts
 bridge.on('session.started', (session) => {
@@ -300,6 +329,7 @@ session: {
   hangup: { markTimeoutMs: 7000 },              // goodbye watchdog
   vad: undefined,                               // normalized VAD, mapped per provider
   noiseAdaptiveVad: undefined,                  // opt-in noise → VAD escalation ({} enables; see its section)
+  keypad: undefined,                            // opt-in DTMF → one user turn per entry ({} enables; see its section)
   toolResultDelivery: 'afterPlayback',          // or 'immediate'
   toolBackgroundAudio: undefined,               // default hold audio for tools
   handoffVoicePolicy: 'keep',                   // or 'reconnect' to switch voices

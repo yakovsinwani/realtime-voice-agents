@@ -32,7 +32,7 @@ npm run assets:generate  # re-synthesize assets/*.ulaw hold-audio loops
 
 ## Layout
 
-`src/bridge/` engine (CallSession = orchestrator, ~1100 lines) · `src/providers/` base + openai-compatible + gemini · `src/tools/` tool()/strategies/middleware · `src/playback/` mark tracker · `src/interruption/` guards + rate limiter · `src/audio/` mulaw/resampler/transcode + background player · `src/testing/` fakes (shipped via `/testing` subpath) · entry files `src/{index,openai,xai,gemini,store}.ts` + `src/{twilio,audio,testing}.entry.ts` map 1:1 to subpath exports in package.json.
+`src/bridge/` engine (CallSession = orchestrator, ~1100 lines) · `src/providers/` base + openai-compatible + gemini · `src/tools/` tool()/strategies/middleware · `src/playback/` mark tracker · `src/interruption/` guards + rate limiter · `src/dtmf/` keypad collector (DTMF → one user turn; raw `dtmf` event fires after it consumed the key) · `src/audio/` mulaw/resampler/transcode + background player · `src/testing/` fakes (shipped via `/testing` subpath) · entry files `src/{index,openai,xai,gemini,store}.ts` + `src/{twilio,audio,testing}.entry.ts` map 1:1 to subpath exports in package.json.
 
 ## Testing conventions
 
