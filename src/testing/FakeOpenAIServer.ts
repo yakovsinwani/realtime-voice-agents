@@ -15,6 +15,14 @@ import { WebSocketServer, type WebSocket } from 'ws';
 export interface FakeOpenAIServerOptions {
   /** Auto-ack session.update with session.updated. Default true. */
   autoAckSessionUpdate?: boolean;
+  /**
+   * Refuse sessions: close each new socket immediately, before
+   * session.created — a provider that is down or rejecting (exercises
+   * connect failures and provider fallback chains). Mutable at runtime via
+   * the server's `refuseConnections` field; refused sockets are counted in
+   * `refusedConnections` and never appear in `connections`.
+   */
+  refuseConnections?: boolean;
 }
 
 export interface FakeAudioResponseOptions {
@@ -164,6 +172,10 @@ export class FakeOpenAIConnection {
 
 export class FakeOpenAIServer {
   readonly connections: FakeOpenAIConnection[] = [];
+  /** Flip at runtime to start/stop refusing sessions (see the option's docs). */
+  refuseConnections: boolean;
+  /** Sockets closed by `refuseConnections` before a session was created. */
+  refusedConnections = 0;
   private readonly wss: WebSocketServer;
   private readonly options: FakeOpenAIServerOptions;
   readonly url: string;
@@ -172,7 +184,13 @@ export class FakeOpenAIServer {
     this.wss = wss;
     this.url = url;
     this.options = options;
+    this.refuseConnections = options.refuseConnections ?? false;
     wss.on('connection', (socket, request) => {
+      if (this.refuseConnections) {
+        this.refusedConnections++;
+        socket.close(1011, 'fake server refusing sessions');
+        return;
+      }
       const connection = new FakeOpenAIConnection(this, socket, request.headers);
       this.connections.push(connection);
       socket.on('message', (raw) => {

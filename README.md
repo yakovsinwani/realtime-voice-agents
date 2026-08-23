@@ -104,6 +104,25 @@ geminiLive({ model: 'gemini-2.5-flash-native-audio-preview-12-2025', voice: 'Aoe
 
 One `SessionOptions` surface configures all three; where a provider can't honor a knob, the fallback is documented and pinned by the parity test suite.
 
+## Provider fallbacks
+
+One bad API key, an exhausted quota, or a provider outage should not send your calls to dead air. Give the bridge backup providers and it tries them in order while the call is being established:
+
+```ts
+const bridge = new TwilioRealtimeBridge({
+  agent,
+  provider: openaiRealtime(), // primary
+  fallbacks: [xaiRealtime(), geminiLive()], // tried in order if it fails to come up
+});
+```
+
+- **Connect-time only.** A provider that fails to answer (rejected key, no credits, refused socket, connect timeout) is dropped and the next one is tried immediately — no backoff between attempts. Once a provider answers, the call stays with it: mid-call reconnects reuse the same provider (per the `session.reconnect` policy), and a mid-call death past that budget fails the call rather than switching voices mid-conversation.
+- **Observable.** Each advance emits `provider.fallback` (`{ from, to, error }`) on the session — count these to alarm on a degraded primary.
+- **Voices don't cross vendors.** Configure the voice per factory (`openaiRealtime({ voice: 'marin' })`, `xaiRealtime({ voice: 'eve' })`) rather than on the `Agent` — an OpenAI voice name would fail the xAI/Gemini connect and the chain would skip past a healthy provider.
+- **Latency.** Each dead provider costs up to its `connectTimeoutMs` (default 10s) before the next is tried — set a tighter one on the primary if its endpoint tends to hang rather than refuse. A [pre-synthesized greeting](#pre-synthesized-greeting-15s-to-first-word) bursts onto the line before any handshake, so the caller hears a voice while the chain walks.
+
+Testing it: `FakeOpenAIServer.start({ refuseConnections: true })` gives you a provider that is "down" (flip `server.refuseConnections` at runtime to script recoveries) — see `src/bridge/fallback.test.ts` for ready-made scenarios.
+
 ## Tools: Zod schemas + execution strategies
 
 ```ts
@@ -252,7 +271,7 @@ Bundled presets (all synthesized, license-free, seamless loops): `elevator-jazz`
 
 ## Events (session)
 
-`call.started/ended/failed` · `provider.connected/reconnecting/reconnected/closed` · `agent.speech.started/ended` (generation) · **`playback.started/finished/interrupted`** (what the caller heard, mark-confirmed) · `user.speech.started/ended` · `transcript.user/agent` · `tool.started/completed/failed` · `tool.approval.required` · `agent.handoff` · `interruption` / `interruption.blocked` · `vad.suggestion` / `vad.adjusted` (noise-adaptive VAD) · `background_audio.started/stopped` · `dtmf` · `usage.updated` · `error`.
+`call.started/ended/failed` · `provider.connected/fallback/reconnecting/reconnected/closed` · `agent.speech.started/ended` (generation) · **`playback.started/finished/interrupted`** (what the caller heard, mark-confirmed) · `user.speech.started/ended` · `transcript.user/agent` · `tool.started/completed/failed` · `tool.approval.required` · `agent.handoff` · `interruption` / `interruption.blocked` · `vad.suggestion` / `vad.adjusted` (noise-adaptive VAD) · `background_audio.started/stopped` · `dtmf` · `usage.updated` · `error`.
 
 ```ts
 bridge.on('session.started', (session) => {
@@ -296,7 +315,7 @@ Outbound calls: the greeting waits for a human — feed your status callback int
 `realtime-voice-agents/testing` ships the harness this package is tested with:
 
 - **`FakeTwilioMediaStream`** — a scripted caller with an exact playout simulation: marks echo only after the media before them "plays"; `clear` discards buffered audio and echoes pending marks, like real Twilio.
-- **`FakeOpenAIServer`** — a real-WebSocket GA-protocol server you script (`sendAudioResponse`, `sendToolCall`, `sendSpeechStarted`, drops).
+- **`FakeOpenAIServer`** — a real-WebSocket GA-protocol server you script (`sendAudioResponse`, `sendToolCall`, `sendSpeechStarted`, drops, `refuseConnections` for down-provider/fallback scenarios).
 - **`FakeGeminiLive`** — a scripted `@google/genai` seam for the Gemini provider.
 
 ```ts

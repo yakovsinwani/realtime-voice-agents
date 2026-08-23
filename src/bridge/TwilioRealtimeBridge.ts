@@ -153,6 +153,7 @@ export class TwilioRealtimeBridge extends TypedEmitter<BridgeEventMap> {
         transport,
         start,
         providerFactory: this.config.provider,
+        fallbacks: this.config.fallbacks,
         agent,
         options,
         store: this.store,

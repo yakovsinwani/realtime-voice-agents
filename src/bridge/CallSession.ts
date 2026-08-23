@@ -61,6 +61,8 @@ export interface CallSessionDeps {
   transport: TwilioMediaTransport;
   start: TwilioStartEvent;
   providerFactory: ProviderFactory;
+  /** Backup factories tried in order when `providerFactory` fails to connect. */
+  fallbacks?: readonly ProviderFactory[];
   agent: Agent;
   options: SessionOptions;
   store: SessionStore;
@@ -94,6 +96,8 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
   private readonly timers = new Set<NodeJS.Timeout>();
 
   private provider: BaseRealtimeProvider | null = null;
+  /** Primary + fallbacks, in try-order. Only walked while connecting. */
+  private readonly providerChain: readonly ProviderFactory[];
   private activeAgentValue: Agent;
   private generating = false;
   private currentResponseId: string | null = null;
@@ -168,6 +172,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     this.callSid = deps.start.start.callSid;
     this.streamSid = deps.start.start.streamSid ?? deps.start.streamSid;
     this.log = childLogger(deps.logger, { callSid: this.callSid });
+    this.providerChain = [deps.providerFactory, ...(deps.fallbacks ?? [])];
     this.activeAgentValue = deps.agent;
     this.context = new SessionContext(deps.options.context);
     this.interruptions = new InterruptionController(deps.options.interruptions);
@@ -217,15 +222,10 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
   async begin(): Promise<void> {
     // Burst-write the pre-synthesized greeting BEFORE the provider handshake:
     // the caller hears a voice within ~250ms while the model session builds.
+    // (It also covers the extra latency of walking a fallback chain.)
     this.playPreGreeting();
-    try {
-      this.provider = this.deps.providerFactory({ logger: this.log, callSid: this.callSid });
-      this.wireProvider(this.provider);
-      await this.provider.connect(this.buildProviderInit());
-    } catch (error) {
-      this.fail(error instanceof Error ? error : new Error(String(error)), 'provider-failed');
-      return;
-    }
+    const connected = await this.connectInitialProvider();
+    if (!connected) return; // chain exhausted (already failed) or torn down while connecting
     if (this.stateValue !== 'connecting') return; // torn down while connecting
     this.stateValue = 'active';
     this.emit('provider.connected');
@@ -262,6 +262,53 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     this.armIdleTimer();
     void this.saveSnapshot();
     this.maybeGreet();
+  }
+
+  /**
+   * Walk primary + fallbacks until one connects. A provider that fails to
+   * come up is detached BEFORE the chain advances, so a half-open socket's
+   * late events can never reach the session once the next provider owns the
+   * call. Connect-time only by design: once a provider has answered, the
+   * call stays with it. Returns false after failing the call (chain
+   * exhausted) or when the call was torn down while connecting.
+   */
+  private async connectInitialProvider(): Promise<boolean> {
+    let lastFrom = 'provider';
+    let lastError: Error | null = null;
+    for (const factory of this.providerChain) {
+      let provider: BaseRealtimeProvider;
+      try {
+        provider = factory({ logger: this.log, callSid: this.callSid });
+      } catch (error) {
+        lastError = toError(error);
+        this.log.warn('provider factory threw — trying the next fallback', {
+          error: String(lastError),
+        });
+        continue;
+      }
+      if (lastError) {
+        this.emit('provider.fallback', { from: lastFrom, to: provider.name, error: lastError });
+      }
+      this.provider = provider;
+      this.wireProvider(provider);
+      try {
+        await provider.connect(this.buildProviderInit());
+        return true;
+      } catch (error) {
+        provider.removeAllListeners();
+        void provider.close().catch(() => {});
+        this.provider = null;
+        if (this.stateValue !== 'connecting') return false; // torn down while connecting
+        lastFrom = provider.name;
+        lastError = toError(error);
+        this.log.warn('provider failed to connect', {
+          provider: provider.name,
+          error: String(lastError),
+        });
+      }
+    }
+    this.fail(lastError ?? new Error('provider connect failed'), 'provider-failed');
+    return false;
   }
 
   /** The outbound leg was answered (host's Twilio status callback). */
@@ -1638,6 +1685,10 @@ const PREGREETING_MARK = 'pre:greeting';
 const PREGREETING_CHUNK_BYTES = 3200;
 
 type ToolOutcome = { ok: true; result: unknown } | { ok: false; payload: unknown; message: string };
+
+function toError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}
 
 function safeJsonStringify(value: unknown): string {
   try {
