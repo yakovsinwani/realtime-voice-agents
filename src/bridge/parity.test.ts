@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import * as z from 'zod';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Agent } from '../agents/Agent.js';
+import { DEFAULT_KEYPAD_INSTRUCTIONS } from '../dtmf/KeypadCollector.js';
 import { pcm16ToMulaw } from '../audio/mulaw.js';
 import { tool } from '../tools/tool.js';
 import { geminiLive } from '../gemini.js';
@@ -349,5 +350,51 @@ describe('provider parity: one config surface', () => {
 
     expect(server.latest.eventsOfType('response.create')).toHaveLength(0);
     expect(fakeGemini.latest.clientContents).toHaveLength(0);
+  });
+
+  it('keypad: the same entry lands as a USER turn that triggers a response on every provider; the note reaches every system prompt', async () => {
+    const server = await FakeOpenAIServer.start();
+    const fakeGemini = new FakeGeminiLive();
+    const session: Partial<SessionOptions> = { ...SESSION, keypad: {} };
+    const openaiBridge = new TwilioRealtimeBridge({
+      agent: AGENT,
+      provider: ({ logger }) =>
+        new OpenAICompatibleProvider({ apiKey: 'k', model: 'gpt-realtime', baseUrl: server.url }, logger),
+      session,
+    });
+    const geminiBridge = new TwilioRealtimeBridge({
+      agent: AGENT,
+      provider: geminiLive({ connector: fakeGemini.connector, model: 'gemini-test' }),
+      session,
+    });
+    cleanup.push(async () => {
+      await openaiBridge.close();
+      await geminiBridge.close();
+      await server.close();
+    });
+
+    const fakeA = new FakeTwilioMediaStream();
+    openaiBridge.handleConnection(fakeA);
+    fakeA.connect();
+    const fakeB = new FakeTwilioMediaStream();
+    geminiBridge.handleConnection(fakeB);
+    fakeB.connect();
+    await waitFor(() => openaiBridge.getSession(fakeA.callSid)?.state === 'active');
+    await waitFor(() => geminiBridge.getSession(fakeB.callSid)?.state === 'active');
+
+    for (const fake of [fakeA, fakeB]) for (const key of '12#') fake.sendDtmf(key);
+
+    const item = await server.latest.waitForEvent('conversation.item.create');
+    expect(item.item.role).toBe('user');
+    expect(item.item.content[0].text).toContain('[keypad] I typed on my phone keypad: 12');
+    await server.latest.waitForEvent('response.create');
+    expect(server.latest.eventsOfType('session.update')[0]!.session.instructions).toContain(DEFAULT_KEYPAD_INSTRUCTIONS);
+
+    await waitFor(() => fakeGemini.latest.clientContents.length === 1, 2000, 'gemini client content');
+    const content = fakeGemini.latest.clientContents[0]!;
+    expect(content.turns[0]!.role).toBe('user');
+    expect(content.turns[0]!.parts[0].text).toContain('[keypad] I typed on my phone keypad: 12');
+    expect(content.turnComplete).toBe(true); // Gemini's "respond now"
+    expect((fakeGemini.latest.params.config as any).systemInstruction).toContain(DEFAULT_KEYPAD_INSTRUCTIONS);
   });
 });

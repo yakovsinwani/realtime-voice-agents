@@ -1,4 +1,5 @@
 import type { Agent } from '../agents/Agent.js';
+import type { KeypadEntry } from '../dtmf/KeypadCollector.js';
 import type { ProviderUsage } from '../providers/base/events.js';
 import type { TranscriptEntry } from '../session/transcript.js';
 import type { UsageInfo } from '../session/usage.js';
@@ -104,7 +105,12 @@ export interface SessionEventMap {
   'background_audio.started': (info: { preset?: string }) => void;
   'background_audio.stopped': (info: { preset?: string }) => void;
 
+  /** Raw keypress (every Twilio dtmf frame). With `keypad` configured it fires AFTER the collector consumed the key. */
   dtmf: (info: { digit: string }) => void;
+  /** A complete keypad entry (`keypad` option): submit key, `maxDigits`, or inter-digit timeout. */
+  'keypad.entry': (entry: KeypadEntry) => void;
+  /** The caller pressed the clear key; `discarded` is what the buffer held. */
+  'keypad.cleared': (info: { discarded: string }) => void;
   'usage.updated': (usage: UsageInfo, delta: ProviderUsage) => void;
   error: (error: Error) => void;
 }

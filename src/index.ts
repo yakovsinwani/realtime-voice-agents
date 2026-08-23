@@ -109,6 +109,21 @@ export {
   type InterruptionBlockCause,
 } from './interruption/InterruptionController.js';
 
+// Keypad (DTMF) input
+export {
+  KeypadCollector,
+  DEFAULT_KEYPAD_OPTIONS,
+  DEFAULT_KEYPAD_INSTRUCTIONS,
+  DEFAULT_KEYPAD_CLEAR_MESSAGE,
+  defaultKeypadMessage,
+  type KeypadOptions,
+  type KeypadEntry,
+  type KeypadEntryReason,
+  type KeypadHandle,
+  type KeypadKeyKind,
+  type KeypadCollectorHooks,
+} from './dtmf/KeypadCollector.js';
+
 // Noise-adaptive VAD
 export {
   NoiseAdaptiveVadController,

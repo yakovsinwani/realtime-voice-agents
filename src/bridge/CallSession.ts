@@ -14,6 +14,14 @@ import type { BackgroundAudioOptions, BackgroundAudioSpec } from '../audio/backg
 import type { Agent } from '../agents/Agent.js';
 import { collectAgentGraph } from '../agents/Agent.js';
 import { createHandoffTool, isHandoffDirective } from '../agents/handoff.js';
+import {
+  DEFAULT_KEYPAD_CLEAR_MESSAGE,
+  DEFAULT_KEYPAD_INSTRUCTIONS,
+  KeypadCollector,
+  defaultKeypadMessage,
+  type KeypadEntry,
+  type KeypadHandle,
+} from '../dtmf/KeypadCollector.js';
 import { InterruptionController } from '../interruption/InterruptionController.js';
 import { TypedEmitter } from '../internal/events.js';
 import { childLogger, type Logger } from '../logging/logger.js';
@@ -80,12 +88,18 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
   readonly streamSid: string;
   readonly callInfo: ToolCallInfo;
   readonly context: SessionContext;
+  /**
+   * Keypad (DTMF) input handle: digits buffered so far, `clear()`, `submit()`.
+   * Inert (empty, no-ops) unless the `keypad` session option is configured.
+   */
+  readonly keypad: KeypadHandle;
 
   private stateValue: CallState = 'connecting';
   private readonly deps: CallSessionDeps;
   private readonly log: Logger;
   private readonly tracker = new PlaybackTracker();
   private readonly interruptions: InterruptionController;
+  private readonly keypadCollector: KeypadCollector | null;
   private readonly usageAccumulator = new UsageAccumulator();
   private readonly toolQueue = new ToolResultQueue();
   private readonly transcriptEntries: TranscriptEntry[] = [];
@@ -176,6 +190,20 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     this.activeAgentValue = deps.agent;
     this.context = new SessionContext(deps.options.context);
     this.interruptions = new InterruptionController(deps.options.interruptions);
+    this.keypadCollector = deps.options.keypad
+      ? new KeypadCollector(deps.options.keypad, {
+          onEntry: (entry) => this.onKeypadEntry(entry),
+          onClear: (info) => this.onKeypadCleared(info),
+        })
+      : null;
+    const collector = this.keypadCollector;
+    this.keypad = {
+      get digits() {
+        return collector?.digits ?? '';
+      },
+      clear: () => collector?.clear(),
+      submit: () => collector?.submit(),
+    };
 
     const params = deps.start.start.customParameters ?? {};
     this.callInfo = {
@@ -474,10 +502,18 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     return tools;
   }
 
+  /** Agent instructions plus the kit's own notes that must survive handoffs (keypad). */
+  private composeInstructions(): string {
+    const base = this.activeAgentValue.resolveInstructions(this.context);
+    const keypad = this.deps.options.keypad;
+    if (!keypad || keypad.instructions === false) return base;
+    return `${base}\n\n${keypad.instructions ?? DEFAULT_KEYPAD_INSTRUCTIONS}`;
+  }
+
   private buildProviderInit(): ProviderSessionInit {
     return {
       instructions:
-        this.activeAgentValue.resolveInstructions(this.context) +
+        this.composeInstructions() +
         (this.pregreeting
           ? `\n\nYou already opened the call by saying: "${this.pregreeting.text}". Do not greet again — continue the conversation from there.`
           : ''),
@@ -511,7 +547,12 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     transport.on('dtmf', (event) => {
       this.clearIdleTimer();
       this.nudgeCount = 0;
-      this.emit('dtmf', { digit: event.dtmf.digit });
+      const digit = event.dtmf.digit;
+      // The collector consumes the key BEFORE the raw event fires: a host
+      // listener sees `session.keypad.digits` already updated and can
+      // `clear()` a key it decides to handle itself.
+      this.handleKeypress(digit);
+      this.emit('dtmf', { digit });
     });
     transport.on('stop', () => void this.teardown('caller-hangup'));
     transport.on('close', () => void this.teardown('caller-hangup'));
@@ -1466,7 +1507,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
         );
       }
       await this.provider.updateSession({
-        instructions: this.activeAgentValue.resolveInstructions(this.context),
+        instructions: this.composeInstructions(),
         tools: this.buildProviderInit().tools,
         providerOptions: target.providerOptions,
       });
@@ -1543,6 +1584,40 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     };
     this.transcriptEntries.push(entry);
     this.emit('transcript.agent', entry);
+  }
+
+  // ---- keypad (DTMF) input -------------------------------------------------
+
+  private handleKeypress(key: string): void {
+    if (!this.keypadCollector) return;
+    // Typing means "stop talking, I'm answering". interrupt() no-ops when the
+    // agent is silent; without it a flushed entry would queue its readback
+    // behind whatever stale speech is still playing out.
+    if (this.deps.options.keypad?.interruptOnKeypress !== false) this.interrupt();
+    this.keypadCollector.press(key);
+  }
+
+  private onKeypadEntry(entry: KeypadEntry): void {
+    this.emit('keypad.entry', entry);
+    const message = this.deps.options.keypad?.message;
+    if (message === false) return;
+    // Role 'user', not 'system': the response this triggers must answer the
+    // entry itself — a trailing system item is skipped by the response it
+    // triggers and only lands one response later (field-tested on xAI).
+    this.provider?.sendText((message ?? defaultKeypadMessage)(entry), {
+      role: 'user',
+      triggerResponse: true,
+    });
+  }
+
+  private onKeypadCleared(info: { discarded: string }): void {
+    this.emit('keypad.cleared', info);
+    const clearMessage = this.deps.options.keypad?.clearMessage;
+    if (clearMessage === false) return;
+    this.provider?.sendText(clearMessage ?? DEFAULT_KEYPAD_CLEAR_MESSAGE, {
+      role: 'user',
+      triggerResponse: true,
+    });
   }
 
   // ---- idle nudges ---------------------------------------------------------
@@ -1623,6 +1698,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     for (const timer of this.timers) clearTimeout(timer);
     this.timers.clear();
     this.clearIdleTimer();
+    this.keypadCollector?.dispose();
     this.bgAudio.stop({ immediate: true });
     for (const controller of this.runningTools.values()) {
       controller.abort(new Error('call ended'));
