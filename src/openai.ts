@@ -53,16 +53,16 @@ export interface OpenAIRealtimeOptions {
   connectTimeoutMs?: number;
 }
 
-/** Create a provider factory for the bridge (`provider: openaiRealtime({...})`). */
+/**
+ * Create a provider factory for the bridge (`provider: openaiRealtime({...})`).
+ *
+ * Credentials are resolved per call, when the factory runs — not while the
+ * config is being built. A missing key therefore fails THAT provider's
+ * connect (with a clear error) instead of crashing config construction, so a
+ * fallback chain (`BridgeConfig.fallbacks`) can absorb it.
+ */
 export function openaiRealtime(options: OpenAIRealtimeOptions = {}): ProviderFactory {
-  const apiKey = resolveApiKey(options.apiKey, OPENAI_KEY_ENV_VARS);
-  if (!apiKey) {
-    throw new Error(
-      `openaiRealtime: apiKey missing (pass apiKey or set one of ${OPENAI_KEY_ENV_VARS.join('/')})`,
-    );
-  }
-  const config: OpenAICompatibleProviderConfig = {
-    apiKey,
+  const config: Omit<OpenAICompatibleProviderConfig, 'apiKey'> = {
     model: options.model ?? OPENAI_DEFAULT_MODEL,
     voice: options.voice ?? OPENAI_DEFAULT_VOICE,
     baseUrl: options.baseUrl,
@@ -81,8 +81,13 @@ export function openaiRealtime(options: OpenAIRealtimeOptions = {}): ProviderFac
     },
   };
   return ({ logger }) => {
-    const provider = new OpenAICompatibleProvider(config, logger);
-    return provider;
+    const apiKey = resolveApiKey(options.apiKey, OPENAI_KEY_ENV_VARS);
+    if (!apiKey) {
+      throw new Error(
+        `openaiRealtime: apiKey missing (pass apiKey or set one of ${OPENAI_KEY_ENV_VARS.join('/')})`,
+      );
+    }
+    return new OpenAICompatibleProvider({ ...config, apiKey }, logger);
   };
 }
 

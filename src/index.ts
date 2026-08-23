@@ -31,6 +31,7 @@ export type {
   ToolRunInfo,
   ApprovalRequestInfo,
   VadSuggestionInfo,
+  ProviderFallbackInfo,
 } from './bridge/events.js';
 
 // Agents

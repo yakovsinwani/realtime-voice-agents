@@ -80,22 +80,20 @@ export function buildXaiSessionUpdate(
   return { type: 'session.update', session };
 }
 
-/** Create an xAI Grok Voice provider factory for the bridge. */
+/**
+ * Create an xAI Grok Voice provider factory for the bridge. Credentials are
+ * resolved per call (see `openaiRealtime` — a missing key fails that call's
+ * connect so a fallback chain can absorb it, instead of crashing config
+ * construction).
+ */
 export function xaiRealtime(options: XaiRealtimeOptions = {}): ProviderFactory {
-  const apiKey = resolveApiKey(options.apiKey, XAI_KEY_ENV_VARS);
-  if (!apiKey) {
-    throw new Error(
-      `xaiRealtime: apiKey missing (pass apiKey or set one of ${XAI_KEY_ENV_VARS.join('/')})`,
-    );
-  }
   const transcription =
     options.transcription === false
       ? (false as const)
       : options.transcription
         ? { language: options.transcription.languageHint }
         : undefined;
-  const config: OpenAICompatibleProviderConfig = {
-    apiKey,
+  const config: Omit<OpenAICompatibleProviderConfig, 'apiKey'> = {
     model: options.model ?? XAI_DEFAULT_MODEL,
     voice: options.voice ?? XAI_DEFAULT_VOICE,
     baseUrl: options.baseUrl ?? XAI_BASE_URL,
@@ -132,5 +130,13 @@ export function xaiRealtime(options: XaiRealtimeOptions = {}): ProviderFactory {
       vadTuning: { defaultServerThreshold: 0.85, minServerThreshold: 0.1, maxServerThreshold: 0.9 },
     },
   };
-  return ({ logger }) => new OpenAICompatibleProvider(config, logger);
+  return ({ logger }) => {
+    const apiKey = resolveApiKey(options.apiKey, XAI_KEY_ENV_VARS);
+    if (!apiKey) {
+      throw new Error(
+        `xaiRealtime: apiKey missing (pass apiKey or set one of ${XAI_KEY_ENV_VARS.join('/')})`,
+      );
+    }
+    return new OpenAICompatibleProvider({ ...config, apiKey }, logger);
+  };
 }

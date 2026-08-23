@@ -45,16 +45,14 @@ export interface GeminiLiveOptions {
   connector?: GeminiLiveConnector;
 }
 
-/** Create a Gemini Live provider factory for the bridge. */
+/**
+ * Create a Gemini Live provider factory for the bridge. Credentials are
+ * resolved per call (see `openaiRealtime` — missing credentials fail that
+ * call's connect so a fallback chain can absorb it, instead of crashing
+ * config construction).
+ */
 export function geminiLive(options: GeminiLiveOptions = {}): ProviderFactory {
-  const apiKey = resolveApiKey(options.apiKey, GEMINI_KEY_ENV_VARS);
-  if (!apiKey && !options.vertex && !options.connector) {
-    throw new Error(
-      `geminiLive: credentials missing (pass apiKey, set one of ${GEMINI_KEY_ENV_VARS.join('/')}, or configure vertex)`,
-    );
-  }
-  const config: GeminiLiveProviderConfig = {
-    apiKey,
+  const config: Omit<GeminiLiveProviderConfig, 'apiKey'> = {
     vertex: options.vertex,
     model: options.model ?? GEMINI_DEFAULT_MODEL,
     voice: options.voice ?? GEMINI_DEFAULT_VOICE,
@@ -67,7 +65,15 @@ export function geminiLive(options: GeminiLiveOptions = {}): ProviderFactory {
     connectTimeoutMs: options.connectTimeoutMs,
     connector: options.connector,
   };
-  return ({ logger }) => new GeminiLiveProvider(config, logger);
+  return ({ logger }) => {
+    const apiKey = resolveApiKey(options.apiKey, GEMINI_KEY_ENV_VARS);
+    if (!apiKey && !options.vertex && !options.connector) {
+      throw new Error(
+        `geminiLive: credentials missing (pass apiKey, set one of ${GEMINI_KEY_ENV_VARS.join('/')}, or configure vertex)`,
+      );
+    }
+    return new GeminiLiveProvider({ ...config, apiKey }, logger);
+  };
 }
 
 export {

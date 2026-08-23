@@ -182,6 +182,19 @@ export interface BridgeConfig {
   /** The (root) agent, or a resolver for multi-tenant routing per call. */
   agent: Agent | ((start: TwilioStartEvent) => Agent | Promise<Agent>);
   provider: ProviderFactory;
+  /**
+   * Backup providers tried in order when `provider` fails to come up at call
+   * start (bad key, exhausted quota, outage, connect timeout). Each attempt
+   * emits `provider.fallback`; the call fails only when every fallback is
+   * exhausted. Connect-time only: once a provider answers, the call stays
+   * with it (mid-call reconnects keep using the same provider).
+   *
+   * ```ts
+   * provider: openaiRealtime(),
+   * fallbacks: [xaiRealtime(), geminiLive()],
+   * ```
+   */
+  fallbacks?: ProviderFactory[];
   session?:
     | Partial<SessionOptions>
     | ((start: TwilioStartEvent) => Partial<SessionOptions> | Promise<Partial<SessionOptions>>);

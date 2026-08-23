@@ -43,6 +43,20 @@ export interface ApprovalRequestInfo {
  */
 export type VadSuggestionInfo = VadAdjustment & { willAutoApply: boolean };
 
+/**
+ * While ESTABLISHING the call, a provider failed to come up and the session
+ * is trying the next factory in the fallback chain. Fires only before the
+ * call is active — once a provider has connected, the call stays with it.
+ */
+export interface ProviderFallbackInfo {
+  /** Name of the provider whose connect failed. */
+  from: string;
+  /** Name of the provider being tried instead. */
+  to: string;
+  /** The connect error that triggered the fallback. */
+  error: Error;
+}
+
 // No `extends Record<string, ...>` here: an index signature would widen
 // `keyof` to `string` and let misspelled event names compile silently.
 export interface SessionEventMap {
@@ -54,6 +68,8 @@ export interface SessionEventMap {
   'provider.reconnecting': (info: { attempt: number; delayMs: number }) => void;
   'provider.reconnected': () => void;
   'provider.closed': (info: { code?: number; reason?: string }) => void;
+  /** Connect-time fallback: trying the next provider in the configured chain. */
+  'provider.fallback': (info: ProviderFallbackInfo) => void;
 
   /** Generation-side: the model started/finished producing a response. */
   'agent.speech.started': (info: { responseId: string }) => void;
