@@ -136,7 +136,7 @@ export {
 export { PlaybackTracker, type MarkEchoResult } from './playback/PlaybackTracker.js';
 
 // Session state
-export type { TranscriptEntry } from './session/transcript.js';
+export type { HandoffRecord, TranscriptEntry } from './session/transcript.js';
 export { type UsageInfo, emptyUsage } from './session/usage.js';
 export type { CallSnapshot } from './session/snapshot.js';
 export type { SessionStore } from './session/SessionStore.js';

@@ -93,6 +93,16 @@ export interface SessionEventMap {
   'tool.approval.required': (request: ApprovalRequestInfo) => void;
 
   'agent.handoff': (info: { from: Agent; to: Agent; reason?: string }) => void;
+  /**
+   * A transfer the model asked for was refused. Fires INSTEAD of
+   * `agent.handoff` — the active agent did not change.
+   */
+  'agent.handoff.blocked': (info: {
+    from: Agent;
+    to: Agent;
+    reason?: string;
+    cause: string;
+  }) => void;
 
   interruption: (info: { responseId: string; playedMs: number }) => void;
   'interruption.blocked': (info: { cause: string }) => void;

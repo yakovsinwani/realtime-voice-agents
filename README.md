@@ -184,6 +184,10 @@ const receptionist = new Agent({ name: 'Receptionist', instructions: '…', hand
 
 Each agent in `handoffs` becomes a `transfer_to_<id>` tool. On handoff the session settles the function call, swaps instructions + tools (`session.update` on OpenAI/xAI; close-and-reopen with context carry on Gemini), and triggers a natural continuation — the caller never hears a seam. Also available programmatically: `session.handoffTo('billing')`. Cycles are fine (billing can hand back).
 
+**An agent that just took over cannot transfer again until the caller speaks.** The transfer tool is refused (`agent.handoff.blocked` fires, the model is told why, the active agent does not change); a caller turn — speech or a keypad entry — unlocks it. This makes transfer loops structurally impossible rather than merely discouraged: given the same replayed transcript, each incoming agent otherwise re-derives intent, decides the request is somebody else's, and passes it on. The trade-off is that a pure router node costs an extra caller turn, so direct arcs between agents beat hub-and-spoke. `session.handoffTo()` is host intent and bypasses the lock (it still arms it for the agent it installs).
+
+The context an incoming agent receives is attributed, not flat: each replayed line names the agent that said it, and completed transfers appear as `[transfer] A -> B (reason: …)` lines — so it can see what was already answered and already routed.
+
 ## Built-in call controls
 
 ```ts
@@ -301,7 +305,7 @@ session.on('dtmf', ({ digit }) => {
 
 ## Events (session)
 
-`call.started/ended/failed` · `provider.connected/fallback/reconnecting/reconnected/closed` · `agent.speech.started/ended` (generation) · **`playback.started/finished/interrupted`** (what the caller heard, mark-confirmed) · `user.speech.started/ended` · `transcript.user/agent` · `tool.started/completed/failed` · `tool.approval.required` · `agent.handoff` · `interruption` / `interruption.blocked` · `vad.suggestion` / `vad.adjusted` (noise-adaptive VAD) · `background_audio.started/stopped` · `dtmf` (raw keypress) · `keypad.entry` / `keypad.cleared` (keypad input) · `usage.updated` · `error`.
+`call.started/ended/failed` · `provider.connected/fallback/reconnecting/reconnected/closed` · `agent.speech.started/ended` (generation) · **`playback.started/finished/interrupted`** (what the caller heard, mark-confirmed) · `user.speech.started/ended` · `transcript.user/agent` · `tool.started/completed/failed` · `tool.approval.required` · `agent.handoff` / `agent.handoff.blocked` · `interruption` / `interruption.blocked` · `vad.suggestion` / `vad.adjusted` (noise-adaptive VAD) · `background_audio.started/stopped` · `dtmf` (raw keypress) · `keypad.entry` / `keypad.cleared` (keypad input) · `usage.updated` · `error`.
 
 ```ts
 bridge.on('session.started', (session) => {
