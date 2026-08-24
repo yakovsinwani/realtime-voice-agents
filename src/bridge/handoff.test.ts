@@ -142,6 +142,64 @@ describe('multi-agent handoffs (OpenAI path: session.update)', () => {
     expect(JSON.parse(invoice.item.output)).toEqual({ invoiceId: 'INV-1', amount: 99 });
   });
 
+  it('refuses a second transfer until the caller speaks, then allows it', async () => {
+    bridge = makeBridge();
+    const session = await connectCall();
+    const handoffs: string[] = [];
+    const blocked: Array<{ from: string; to: string; cause: string }> = [];
+    session.on('agent.handoff', ({ from, to }) => handoffs.push(`${from.id}->${to.id}`));
+    session.on('agent.handoff.blocked', ({ from, to, cause }) =>
+      blocked.push({ from: from.id, to: to.id, cause }),
+    );
+
+    server.latest.sendUserTranscript('I have a question about invoice 12');
+    server.latest.sendToolCall({ name: 'transfer_to_billing', argumentsJson: '{"reason":"invoice"}' });
+    await waitFor(() => session.activeAgent.id === 'billing', 2000, 'handoff to billing');
+
+    // Billing bounces the caller straight back without hearing a word — the
+    // exact move that produced 14 transfers in 67 seconds in the field.
+    server.latest.sendToolCall({
+      name: 'transfer_to_receptionist',
+      argumentsJson: '{"reason":"not my department"}',
+    });
+    const refusal = await server.latest.waitForEvent(
+      (f) =>
+        f.type === 'conversation.item.create' &&
+        f.item?.type === 'function_call_output' &&
+        f.item.output.includes('transfer_rejected'),
+    );
+    // The refusal reaches the model, or it just calls the tool again.
+    expect(JSON.parse(refusal.item.output).message).toContain('caller has not spoken');
+    expect(session.activeAgent.id).toBe('billing');
+    expect(blocked).toEqual([{ from: 'billing', to: 'receptionist', cause: 'no-caller-turn' }]);
+    expect(handoffs).toEqual(['receptionist->billing']);
+
+    // A caller turn unlocks the very same transfer.
+    server.latest.sendUserTranscript('Sorry, I actually called about something else');
+    server.latest.sendToolCall({ name: 'transfer_to_receptionist', argumentsJson: '{}' });
+    await waitFor(() => session.activeAgent.id === 'receptionist', 2000, 'transfer after caller turn');
+    expect(handoffs).toEqual(['receptionist->billing', 'billing->receptionist']);
+    expect(blocked).toHaveLength(1);
+  });
+
+  it('programmatic handoffTo bypasses the lock but arms it for the incoming agent', async () => {
+    bridge = makeBridge();
+    const session = await connectCall();
+    const blocked: string[] = [];
+    session.on('agent.handoff.blocked', ({ to }) => blocked.push(to.id));
+
+    // Back-to-back host-driven transfers: no caller turn, both go through.
+    await session.handoffTo('billing');
+    await session.handoffTo('receptionist');
+    expect(session.activeAgent.id).toBe('receptionist');
+    expect(blocked).toEqual([]);
+
+    // The agent the host installed is still locked.
+    server.latest.sendToolCall({ name: 'transfer_to_billing', argumentsJson: '{}' });
+    await waitFor(() => blocked.length === 1, 2000, 'model transfer blocked');
+    expect(session.activeAgent.id).toBe('receptionist');
+  });
+
   it('programmatic handoffTo works and records handoff history in the snapshot', async () => {
     bridge = makeBridge();
     const session = await connectCall();
@@ -191,6 +249,45 @@ describe('multi-agent handoffs (Gemini path: reconnect + context carry)', () => 
     expect(injected.some((c) => c.includes('I want to pay my invoice'))).toBe(true);
     expect(injected.some((c) => c.includes('Billing Department'))).toBe(true);
     expect(session.activeAgent.id).toBe('billing');
+
+    await bridge.close();
+  });
+
+  it('replays the transcript with per-agent attribution and the transfer that happened', async () => {
+    const fakeGemini = new FakeGeminiLive();
+    const { receptionist } = makeAgents();
+    const bridge = new TwilioRealtimeBridge({
+      agent: receptionist,
+      provider: geminiLive({ connector: fakeGemini.connector, model: 'gemini-test' }),
+      session: { greeting: { mode: 'user-initiates' } },
+    });
+    const fake = new FakeTwilioMediaStream();
+    bridge.handleConnection(fake);
+    fake.connect();
+    await waitFor(() => bridge.getSession(fake.callSid)?.state === 'active', 2000, 'active');
+    const session = bridge.getSession(fake.callSid)!;
+
+    fakeGemini.latest.sendInputTranscription('I need a refund on invoice 12');
+    fakeGemini.latest.sendAudioTurn({ pcm24kBase64Chunks: [], transcript: 'Let me get billing.' });
+    await waitFor(() => session.transcript.length === 2, 2000, 'transcript');
+
+    // Tool-initiated so the transfer carries a reason into the replay.
+    fakeGemini.latest.sendToolCall({
+      name: 'transfer_to_billing',
+      args: { reason: 'refund request' },
+    });
+    await waitFor(() => session.activeAgent.id === 'billing', 2000, 'handoff');
+
+    const replay = fakeGemini.latest.clientContents
+      .flatMap((content) => content.turns)
+      .flatMap((turn) => (turn.parts ?? []).map((part: { text?: string }) => part.text ?? ''))
+      .join('\n');
+    // The receiving agent sees WHO said what…
+    expect(replay).toContain('Caller: I need a refund on invoice 12');
+    expect(replay).toContain('Receptionist: Let me get billing.');
+    // …and that the routing already happened, so it does not route again.
+    expect(replay).toContain('[transfer] Receptionist -> Billing Department (reason: refund request)');
+    expect(replay).not.toContain('Agent: Let me get billing.');
 
     await bridge.close();
   });

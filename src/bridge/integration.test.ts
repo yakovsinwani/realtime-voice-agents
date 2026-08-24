@@ -693,7 +693,7 @@ describe('bridge end-to-end (FakeTwilio ⇄ bridge ⇄ FakeOpenAI)', () => {
     );
     const text = history.item.content[0].text as string;
     expect(text).toContain('Caller: I need help with my invoice');
-    expect(text).toContain('Agent: Sure, let me check.');
+    expect(text).toContain('Receptionist: Sure, let me check.');
     await waitFor(() => reconnectEvents.includes('ok'), 2000, 'reconnected event');
 
     // Audio arriving during the gap was buffered and flushed upstream.

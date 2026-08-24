@@ -41,7 +41,11 @@ import type { ProviderToolCall } from '../providers/base/events.js';
 import type { CallSnapshot } from '../session/snapshot.js';
 import type { SessionStore } from '../session/SessionStore.js';
 import { readFileSync } from 'node:fs';
-import { formatTranscriptForInjection, type TranscriptEntry } from '../session/transcript.js';
+import {
+  formatTranscriptForInjection,
+  type HandoffRecord,
+  type TranscriptEntry,
+} from '../session/transcript.js';
 import { UsageAccumulator, type UsageInfo } from '../session/usage.js';
 import { SessionContext, type CallSessionFacade, type ToolCallInfo, type ToolContext } from '../tools/context.js';
 import { composeExecution, decorateTool, type ToolMiddleware } from '../tools/middleware.js';
@@ -159,8 +163,17 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
   /** All agents reachable from the root via handoffs, by id. */
   private readonly agents: Map<string, Agent>;
-  private readonly handoffHistory: Array<{ from: string; to: string; atMs: number }> = [];
+  private readonly handoffHistory: HandoffRecord[] = [];
   private handoffInProgress = false;
+  /**
+   * An agent that just took over cannot transfer again until the caller has
+   * spoken. Without it every incoming agent re-derives intent from the same
+   * replayed transcript, decides the request is not its own, and transfers on
+   * — agents ping-ponging with no caller turn between them (field bug, Aug
+   * 2026). Programmatic `handoffTo()` is host intent and bypasses the lock,
+   * but still arms it for the agent it installs.
+   */
+  private handoffLockedUntilCallerTurn = false;
   /** Pre-synthesized greeting playout state. */
   private pregreeting: { text: string; durationMs: number; played: boolean } | null = null;
 
@@ -648,12 +661,14 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       };
       this.transcriptEntries.push(entry);
       this.nudgeCount = 0;
+      this.handoffLockedUntilCallerTurn = false;
       this.emit('transcript.user', entry);
     });
 
     provider.on('userSpeechStarted', () => {
       this.userSpeechActive = true;
       this.userSpeechStartedAtMs = Date.now();
+      this.handoffLockedUntilCallerTurn = false;
       this.clearIdleTimer();
       this.nudgeCount = 0;
       this.emit('user.speech.started');
@@ -1023,6 +1038,17 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
         const target = this.agents.get(directive.targetAgentId);
         if (!target) {
           this.deliverToolResult(call.id, { error: `unknown agent "${directive.targetAgentId}"` });
+          return;
+        }
+        if (this.handoffLockedUntilCallerTurn) {
+          this.rejectHandoff(target, directive.reason, call.id);
+          this.emit('tool.completed', {
+            ...baseInfo,
+            strategy: tool.strategy,
+            input,
+            result: { handoffBlocked: target.id },
+            durationMs: Date.now() - started,
+          });
           return;
         }
         // Settle the function call first (no response yet), then swap agents —
@@ -1471,22 +1497,56 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
   /** After a reconnect the provider session is blank — restore conversational context. */
   private reinjectHistory(provider: BaseRealtimeProvider): void {
     if (this.transcriptEntries.length === 0) return;
-    const summary = formatTranscriptForInjection(this.transcriptEntries);
+    const summary = formatTranscriptForInjection(this.transcriptEntries, {
+      agentNames: new Map([...this.agents].map(([id, agent]) => [id, agent.name])),
+      handoffs: this.handoffHistory,
+    });
     provider.sendText(
-      `Context: this phone call reconnected mid-conversation. Transcript so far:\n${summary}\nContinue naturally from where it left off; do not greet again.`,
+      `Context: this phone call reconnected mid-conversation. You are ${this.activeAgentValue.name}. ` +
+        `Each line below names who said it; \`[transfer]\` lines are routing that ALREADY happened.\n` +
+        `${summary}\n` +
+        `Anything already answered or already routed above must not be routed again. ` +
+        `Continue naturally from where it left off; do not greet again.`,
       { role: 'system', triggerResponse: false },
     );
   }
 
   // ---- handoff -------------------------------------------------------------
 
+  /**
+   * Refuse a model-initiated transfer from an agent the caller has not spoken
+   * to yet. The refusal must reach the model as the tool result, or it simply
+   * calls the same transfer tool again on its next turn.
+   */
+  private rejectHandoff(target: Agent, reason: string | undefined, callId: string): void {
+    const from = this.activeAgentValue;
+    this.log.warn(
+      `blocked transfer ${from.id} -> ${target.id}: the caller has not spoken since the last one`,
+    );
+    this.deliverToolResult(callId, {
+      error: 'transfer_rejected',
+      message:
+        'You just took over this call and the caller has not spoken since. Do not transfer again ' +
+        'yet — handle their request yourself, or ask them what they need. You may transfer once ' +
+        'they reply.',
+    });
+    this.emit('agent.handoff.blocked', { from, to: target, reason, cause: 'no-caller-turn' });
+  }
+
   private async performHandoff(target: Agent, reason?: string): Promise<void> {
     if (this.stateValue !== 'active' || !this.provider) return;
     if (target.id === this.activeAgentValue.id) return;
     const from = this.activeAgentValue;
     this.activeAgentValue = target;
+    // The incoming agent must hear the caller before it may transfer on.
+    this.handoffLockedUntilCallerTurn = true;
     this.toolset = this.buildToolset();
-    this.handoffHistory.push({ from: from.id, to: target.id, atMs: Date.now() - this.startedAtMs });
+    this.handoffHistory.push({
+      from: from.id,
+      to: target.id,
+      atMs: Date.now() - this.startedAtMs,
+      ...(reason ? { reason } : {}),
+    });
 
     const continueInstruction =
       `You are now ${target.name}. Continue the SAME phone conversation naturally — ` +
@@ -1598,6 +1658,9 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
   }
 
   private onKeypadEntry(entry: KeypadEntry): void {
+    // A completed entry is a caller turn (it is injected as one below), so it
+    // releases an agent that took over and has not heard the caller yet.
+    this.handoffLockedUntilCallerTurn = false;
     this.emit('keypad.entry', entry);
     const message = this.deps.options.keypad?.message;
     if (message === false) return;
