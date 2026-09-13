@@ -2,6 +2,7 @@ export {
   BaseRealtimeProvider,
   type ProviderFactory,
   type ProviderFactoryContext,
+  type ProviderHistoryEntry,
   type ProviderSessionInit,
   type ProviderToolSchema,
   type SendTextOptions,

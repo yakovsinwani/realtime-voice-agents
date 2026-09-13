@@ -6,3 +6,11 @@ export {
   type FakeAudioResponseOptions,
 } from './FakeOpenAIServer.js';
 export { FakeGeminiLive, FakeGeminiSession } from './FakeGeminiLive.js';
+export {
+  FakeGptLiveServer,
+  FakeGptLiveConnection,
+  mulawToneBase64,
+  mulawSilenceDeltas,
+  type FakeGptLiveServerOptions,
+  type FakeSpeechOptions,
+} from './FakeGptLiveServer.js';

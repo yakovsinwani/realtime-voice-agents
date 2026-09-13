@@ -25,6 +25,13 @@ export interface VadConfig {
   createResponse?: boolean;
 }
 
+/** One prior conversation turn, for providers that seed history at session start. */
+export interface ProviderHistoryEntry {
+  /** `developer` carries engine notes (transfer records, continuation context). */
+  role: 'user' | 'assistant' | 'developer';
+  text: string;
+}
+
 export interface ProviderToolSchema {
   name: string;
   description?: string;
@@ -61,6 +68,12 @@ export interface ProviderSessionInit {
    * legacy fire-and-forget update behavior exactly as before.
    */
   serializedSessionUpdates?: boolean;
+  /**
+   * Conversation so far, oldest first, for providers that seed history into
+   * the new session at connect time (capability `startupHistory`); ignored by
+   * providers that re-inject history as text after connecting.
+   */
+  history?: ProviderHistoryEntry[];
   /** Provider-native session options, deep-merged last (escape hatch). */
   providerOptions?: Record<string, unknown>;
 }

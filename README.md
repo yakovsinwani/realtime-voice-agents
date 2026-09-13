@@ -5,10 +5,10 @@
 [![node](https://img.shields.io/node/v/realtime-voice-agents)](https://www.npmjs.com/package/realtime-voice-agents)
 [![license](https://img.shields.io/npm/l/realtime-voice-agents)](LICENSE)
 
-**Provider-agnostic bridge between Twilio Media Streams and realtime speech-to-speech AI.** Build phone voice agents in Node.js with one `Agent` / `tool()` / session API across **OpenAI Realtime**, **xAI Grok Voice**, and **Gemini Live** — with multi-agent handoffs, tool execution strategies, hardware-confirmed playback tracking, true barge-in, and hold audio.
+**Provider-agnostic bridge between Twilio Media Streams and realtime speech-to-speech AI.** Build phone voice agents in Node.js with one `Agent` / `tool()` / session API across **OpenAI Realtime**, **OpenAI GPT-Live** (full-duplex), **xAI Grok Voice**, and **Gemini Live** — with multi-agent handoffs, tool execution strategies, hardware-confirmed playback tracking, true barge-in, and hold audio.
 
 ```
- Caller ── PSTN ── Twilio ── Media Stream WS ──▶ TwilioRealtimeBridge ──▶ OpenAI / xAI / Gemini
+ Caller ── PSTN ── Twilio ── Media Stream WS ──▶ TwilioRealtimeBridge ──▶ OpenAI Realtime / GPT-Live / xAI / Gemini
                                  μ-law 8kHz          CallSession              realtime S2S
 ```
 
@@ -81,6 +81,7 @@ Point your Twilio number's Voice webhook at `POST /twilio/voice`. That's a worki
 
 ```ts
 import { openaiRealtime } from 'realtime-voice-agents/openai';
+import { gptLive } from 'realtime-voice-agents/gpt-live';
 import { xaiRealtime } from 'realtime-voice-agents/xai';
 import { geminiLive } from 'realtime-voice-agents/gemini';
 
@@ -89,20 +90,37 @@ openaiRealtime({
   voice: 'marin',
   vad: { type: 'server', silenceDurationMs: 700 },
 });
+gptLive({
+  voice: 'marin',
+  delegation: { model: 'gpt-5.6-terra', instructions: 'Backend procedures and tool rules.' },
+});
 xaiRealtime({ model: 'grok-voice-latest', voice: 'eve' });
 geminiLive({ model: 'gemini-2.5-flash-native-audio-preview-12-2025', voice: 'Aoede' });
 // or bring your own: implement BaseRealtimeProvider and pass a factory.
 ```
 
-|                        | OpenAI                            | xAI                               | Gemini Live                            |
-| ---------------------- | --------------------------------- | --------------------------------- | -------------------------------------- |
-| Audio path             | μ-law passthrough                 | μ-law passthrough                 | transcoded (stateful resampler)        |
-| Barge-in truncation    | ✅ `item.truncate`                | buffer flush only                 | server self-truncates                  |
-| Mid-session agent swap | ✅ `session.update`               | ✅ `session.update`               | reconnect + context carry              |
-| Session resumption     | —                                 | —                                 | ✅ handles, replayed on reconnect      |
-| Reconnect              | backoff + transcript re-injection | backoff + transcript re-injection | backoff + resumption (or re-injection) |
+|                        | OpenAI Realtime                   | GPT-Live                                    | xAI                               | Gemini Live                            |
+| ---------------------- | --------------------------------- | ------------------------------------------- | --------------------------------- | -------------------------------------- |
+| Audio path             | μ-law passthrough                 | μ-law passthrough (continuous stream)       | μ-law passthrough                 | transcoded (stateful resampler)        |
+| Turn-taking / barge-in | bridge-owned (guards, truncate)   | model-owned (full-duplex; guards observe)   | server VAD, buffer flush only     | server self-truncates                  |
+| Tools run on           | the voice model                   | a backend Responses model (voice keeps talking) | the voice model               | the voice model                        |
+| Mid-session agent swap | ✅ `session.update`               | reconnect + history seeded via `session.input` | ✅ `session.update`            | reconnect + context carry              |
+| Session resumption     | —                                 | —                                           | —                                 | ✅ handles, replayed on reconnect      |
+| Reconnect              | backoff + transcript re-injection | backoff + seeded history                    | backoff + transcript re-injection | backoff + resumption (or re-injection) |
 
-One `SessionOptions` surface configures all three; where a provider can't honor a knob, the fallback is documented and pinned by the parity test suite.
+One `SessionOptions` surface configures all four; where a provider can't honor a knob, the fallback is documented and pinned by the parity test suite.
+
+### GPT-Live: full-duplex, two prompts
+
+[GPT-Live](https://developers.openai.com/api/docs/guides/live) is a different API from Realtime (`/v1/live/sessions`), not a new Realtime model. The voice model listens while it speaks and decides on its own when to answer and when to stop; a **backend** Responses model does the reasoning and calls your tools while the conversation keeps going. The bridge translates that into the same `Agent` / `tool()` surface, with these differences:
+
+- **Two prompts.** `Agent.instructions` is the *voice* prompt (style, backchannel and interruption policy, when to delegate). `gptLive({ delegation: { instructions } })` is the *backend* prompt (procedures, tool rules). Per-agent backend overrides go through `providerOptions: { delegation: { responses: { ... } } }`.
+- **Barge-in is the model's.** `interruptions`, `vad`, `noiseAdaptiveVad`, `session.interrupt()` and `updateVad()` become documented no-ops: nothing is cancelled, cleared or truncated, and `user.speech.*` events are not emitted (the wire has no VAD events). Protect a greeting through the voice prompt ("finish the opening sentence before yielding").
+- **Tools never pause the voice.** Results are delivered the moment they are ready regardless of `toolResultDelivery`; an interruption does not cancel a running tool, and its result still reaches the backend. Results are relayed in the model's own words — use exact wording only through the voice prompt.
+- **Greetings, nudges and goodbyes** (`greeting.instructions`, `idle.prompts`, `finish_call`) are delivered as `session.commentary.append` — the append that reliably produces speech on demand. Keypad entries and deferred results are `session.thinking.append`; runtime instructions are `session.instructions.append`. Each append is capped at 500 tokens (long texts are split).
+- **Immutable session.** Instructions, voice and audio format cannot change after start, so handoffs and reconnects open a fresh session and seed the attributed transcript through `session.input` (≤ 128 messages) — the anti-loop replay is preserved. Sessions expire after 120 minutes; an expiry reconnects the same way.
+- **Deafness feeds silence.** The model's session clock runs on input audio, so `deafness` options replace caller audio with silence instead of dropping frames.
+- **Billing is per second** of session (plus backend tokens). `session.usage.audioSeconds` carries the running total; backend token usage is summed from `response.completed`. The provider sends `session.close` on teardown and waits for `session.closed`, so a hung-up call never keeps billing.
 
 ## Provider fallbacks
 
@@ -351,6 +369,7 @@ Outbound calls: the greeting waits for a human — feed your status callback int
 
 - **`FakeTwilioMediaStream`** — a scripted caller with an exact playout simulation: marks echo only after the media before them "plays"; `clear` discards buffered audio and echoes pending marks, like real Twilio.
 - **`FakeOpenAIServer`** — a real-WebSocket GA-protocol server you script (`sendAudioResponse`, `sendToolCall`, `sendSpeechStarted`, drops, `refuseConnections` for down-provider/fallback scenarios).
+- **`FakeGptLiveServer`** — a real-WebSocket Live-protocol server: `sendSpeech` (speech chunks + the silence that closes the gate), timed transcripts, backend function calls in `response.event` envelopes, usage ticks, server-side closes.
 - **`FakeGeminiLive`** — a scripted `@google/genai` seam for the Gemini provider.
 
 ```ts
@@ -368,7 +387,7 @@ caller.advancePlayback(200); // deterministic playout — assert on playback eve
 
 ## Subpath exports
 
-`realtime-voice-agents` (core) · `/openai` · `/xai` · `/gemini` · `/twilio` (wire types, TwiML, REST) · `/audio` (μ-law, resampler, transcoders, background player) · `/store` (SessionStore + in-memory) · `/testing`.
+`realtime-voice-agents` (core) · `/openai` · `/gpt-live` · `/xai` · `/gemini` · `/twilio` (wire types, TwiML, REST) · `/audio` (μ-law, resampler, transcoders, background player) · `/store` (SessionStore + in-memory) · `/testing`.
 
 ## Observability & state
 

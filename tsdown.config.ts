@@ -6,6 +6,7 @@ export default defineConfig({
     openai: 'src/openai.ts',
     xai: 'src/xai.ts',
     gemini: 'src/gemini.ts',
+    'gpt-live': 'src/gpt-live.ts',
     twilio: 'src/twilio.entry.ts',
     audio: 'src/audio.entry.ts',
     store: 'src/store.ts',

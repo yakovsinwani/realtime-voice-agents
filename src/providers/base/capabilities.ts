@@ -45,4 +45,30 @@ export interface ProviderCapabilities {
    * means the provider declared none (see VadTuningProfile).
    */
   vadTuning?: VadTuningProfile;
+  /**
+   * Who decides when the agent speaks and stops. `'bridge'` (absent): the
+   * provider's server VAD detects turns and the bridge arbitrates barge-ins
+   * (cancel / clear / truncate through the interruption guard). `'model'`: a
+   * full-duplex model listens while it talks and handles interruptions itself
+   * (GPT-Live). The bridge then never cancels, clears or truncates, the
+   * interruption guard is observe-only, `user.speech.*` events are not
+   * available, and deafness options substitute silence for caller audio
+   * instead of dropping frames (the model's session clock runs on input).
+   * Documented fallback, pinned in the parity tests.
+   */
+  turnTaking?: 'bridge' | 'model';
+  /**
+   * `connect()` seeds `init.history` into the new server session, so the
+   * engine skips post-connect transcript re-injection on reconnects and
+   * handoff-reconnects (GPT-Live `session.input`).
+   */
+  startupHistory?: boolean;
+  /**
+   * Tool results feed a backend that runs independently of speech (the voice
+   * model keeps talking while it works), so holding them until playback
+   * finishes only adds latency: the engine delivers results and deferred
+   * injections immediately, regardless of `toolResultDelivery`. Usage is
+   * accounted from the provider's `usage` events (no response carries it).
+   */
+  decoupledBackend?: boolean;
 }
