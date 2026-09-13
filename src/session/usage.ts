@@ -9,6 +9,8 @@ export interface UsageInfo {
   outputTokenDetails: { textTokens: number; audioTokens: number };
   /** Number of model responses accounted. */
   responses: number;
+  /** Cumulative session audio seconds, for duration-billed providers (GPT-Live). */
+  audioSeconds?: number;
 }
 
 export function emptyUsage(): UsageInfo {
@@ -27,6 +29,12 @@ export class UsageAccumulator {
   private usage = emptyUsage();
 
   add(providerUsage: ProviderUsage): UsageInfo {
+    if (providerUsage.audioSeconds !== undefined) {
+      // A duration snapshot is a running total: keep the latest, never sum.
+      this.usage.audioSeconds = Math.max(this.usage.audioSeconds ?? 0, providerUsage.audioSeconds);
+      const tokensOnly = providerUsage.totalTokens === 0 && providerUsage.inputTokens === 0 && providerUsage.outputTokens === 0;
+      if (tokensOnly) return this.snapshot(); // pure duration tick — not a response
+    }
     this.usage.inputTokens += providerUsage.inputTokens;
     this.usage.outputTokens += providerUsage.outputTokens;
     this.usage.totalTokens += providerUsage.totalTokens;

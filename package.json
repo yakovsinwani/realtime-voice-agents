@@ -1,7 +1,7 @@
 {
   "name": "realtime-voice-agents",
   "version": "2.4.0",
-  "description": "Provider-agnostic bridge between Twilio Media Streams and realtime speech-to-speech AI APIs (OpenAI Realtime, xAI Grok Voice, Gemini Live). Multi-agent handoffs, Zod tools with execution strategies, mark-based playback tracking, interruption guards, and hold audio — for Node.js voice agents over the phone.",
+  "description": "Provider-agnostic bridge between Twilio Media Streams and realtime speech-to-speech AI APIs (OpenAI Realtime, OpenAI GPT-Live full-duplex, xAI Grok Voice, Gemini Live). Multi-agent handoffs, Zod tools with execution strategies, mark-based playback tracking, interruption guards, and hold audio \u2014 for Node.js voice agents over the phone.",
   "keywords": [
     "twilio",
     "twilio-media-streams",
@@ -13,6 +13,8 @@
     "speech-to-speech",
     "openai",
     "openai-realtime",
+    "full-duplex",
+    "gpt-live",
     "gemini",
     "gemini-live",
     "xai",
@@ -75,6 +77,16 @@
       "require": {
         "types": "./dist/gemini.d.cts",
         "default": "./dist/gemini.cjs"
+      }
+    },
+    "./gpt-live": {
+      "import": {
+        "types": "./dist/gpt-live.d.mts",
+        "default": "./dist/gpt-live.mjs"
+      },
+      "require": {
+        "types": "./dist/gpt-live.d.cts",
+        "default": "./dist/gpt-live.cjs"
       }
     },
     "./twilio": {

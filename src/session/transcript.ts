@@ -1,3 +1,5 @@
+import type { ProviderHistoryEntry } from '../providers/base/BaseRealtimeProvider.js';
+
 export interface TranscriptEntry {
   role: 'user' | 'agent';
   text: string;
@@ -73,4 +75,46 @@ export function formatTranscriptForInjection(
     .sort((a, b) => a.atMs - b.atMs)
     .map((line) => line.text)
     .join('\n');
+}
+
+/**
+ * The same replay as `formatTranscriptForInjection`, as structured turns for
+ * providers that seed history at session start (`ProviderSessionInit.history`).
+ * Agent lines keep their attribution (`Name: text`) whenever more than one
+ * agent exists on the call, and completed transfers become `developer` notes
+ * in timeline order — the anti-loop guarantees are identical to the text
+ * replay (see the field bug notes there).
+ */
+export function buildHistoryForSeeding(
+  entries: readonly TranscriptEntry[],
+  options: TranscriptInjectionOptions = {},
+): ProviderHistoryEntry[] {
+  const { maxTurns = 30, agentNames, handoffs = [] } = options;
+  const recent = entries.slice(-maxTurns);
+  if (recent.length === 0) return [];
+  const multiAgent = (agentNames?.size ?? 0) > 1 || handoffs.length > 0;
+  const nameOf = (agentId: string | undefined): string =>
+    (agentId ? agentNames?.get(agentId) : undefined) ?? agentId ?? 'Agent';
+
+  const windowStartMs = recent[0]!.timestampMs;
+  const items: Array<{ atMs: number; entry: ProviderHistoryEntry }> = recent.map((entry) => ({
+    atMs: entry.timestampMs,
+    entry:
+      entry.role === 'user'
+        ? { role: 'user', text: entry.text }
+        : { role: 'assistant', text: multiAgent ? `${nameOf(entry.agentId)}: ${entry.text}` : entry.text },
+  }));
+  for (const handoff of handoffs) {
+    if (handoff.atMs < windowStartMs) continue;
+    items.push({
+      atMs: handoff.atMs,
+      entry: {
+        role: 'developer',
+        text:
+          `[transfer] ${nameOf(handoff.from)} -> ${nameOf(handoff.to)}` +
+          (handoff.reason ? ` (reason: ${handoff.reason})` : ''),
+      },
+    });
+  }
+  return items.sort((a, b) => a.atMs - b.atMs).map((item) => item.entry);
 }

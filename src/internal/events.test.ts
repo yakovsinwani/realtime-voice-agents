@@ -22,6 +22,22 @@ describe('TypedEmitter event-name safety', () => {
     expect(got).toBe(42);
   });
 
+  it('removeAllListeners() with no argument detaches everything (Node treats an explicit undefined as an event name)', () => {
+    const probe = new Probe();
+    let hits = 0;
+    probe.on('ping', () => hits++);
+    probe.once('ping', () => hits++);
+    probe.removeAllListeners();
+    probe.fire();
+    expect(hits).toBe(0);
+    expect(probe.listenerCount('ping')).toBe(0);
+    // The single-event form still works too.
+    probe.on('ping', () => hits++);
+    probe.removeAllListeners('ping');
+    probe.fire();
+    expect(hits).toBe(0);
+  });
+
   it('drops error emits with no listener instead of throwing', () => {
     class ErrorProbe extends TypedEmitter<{ error: (error: Error) => void }> {
       trip(): boolean {

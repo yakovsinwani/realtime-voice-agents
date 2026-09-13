@@ -10,6 +10,11 @@ export interface ProviderUsage {
   totalTokens: number;
   inputTokenDetails?: { textTokens?: number; audioTokens?: number; cachedTokens?: number };
   outputTokenDetails?: { textTokens?: number; audioTokens?: number };
+  /**
+   * Cumulative session audio seconds for duration-billed providers (GPT-Live).
+   * A running total, not an increment: accumulators keep the latest value.
+   */
+  audioSeconds?: number;
   /** Provider-native payload for advanced analytics. */
   raw?: RawUsage;
 }

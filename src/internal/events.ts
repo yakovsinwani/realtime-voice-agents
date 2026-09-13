@@ -35,7 +35,11 @@ export class TypedEmitter<Events extends { [K in keyof Events]: Listener }> {
   }
 
   removeAllListeners(event?: keyof Events & string): this {
-    this.emitter.removeAllListeners(event);
+    // Node distinguishes `removeAllListeners()` from `removeAllListeners(undefined)`:
+    // the latter only clears listeners for an event literally named "undefined",
+    // leaving everything attached (a detached provider kept reaching the session).
+    if (event === undefined) this.emitter.removeAllListeners();
+    else this.emitter.removeAllListeners(event);
     return this;
   }
 

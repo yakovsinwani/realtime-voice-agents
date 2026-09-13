@@ -8,7 +8,7 @@
  * socket is released exactly once.
  */
 
-import { base64ByteLength, mulawBytesToMs } from '../audio/mulaw.js';
+import { MULAW_SILENCE_BYTE, base64ByteLength, mulawBytesToMs } from '../audio/mulaw.js';
 import { BackgroundAudioPlayer } from '../audio/background/BackgroundAudioPlayer.js';
 import type { BackgroundAudioOptions, BackgroundAudioSpec } from '../audio/background/presets.js';
 import type { Agent } from '../agents/Agent.js';
@@ -29,6 +29,7 @@ import { PlaybackTracker } from '../playback/PlaybackTracker.js';
 import type {
   BaseRealtimeProvider,
   ProviderFactory,
+  ProviderHistoryEntry,
   ProviderSessionInit,
   VadConfig,
 } from '../providers/base/BaseRealtimeProvider.js';
@@ -42,6 +43,7 @@ import type { CallSnapshot } from '../session/snapshot.js';
 import type { SessionStore } from '../session/SessionStore.js';
 import { readFileSync } from 'node:fs';
 import {
+  buildHistoryForSeeding,
   formatTranscriptForInjection,
   type HandoffRecord,
   type TranscriptEntry,
@@ -142,6 +144,8 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     progress: number;
     /** `progress` at the last watchdog check — no movement for a window = dead leg. */
     progressAtCheck: number;
+    /** Model-owned turn-taking: one-gap wait for the goodbye's next sentence. */
+    grace?: NodeJS.Timeout | null;
   } | null = null;
   private pendingTransfer: { phoneNumber: string; callerId?: string } | null = null;
   private endedReason: CallEndReason | null = null;
@@ -401,6 +405,9 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
   /** Manual barge-in: stop the agent mid-sentence. */
   interrupt(): void {
     if (!this.generating && !this.tracker.isPlaybackActive()) return;
+    // A full-duplex model stops on its own the moment the caller speaks; a
+    // clear here would only cut its live stream (documented, see parity tests).
+    if (this.modelOwnsTurnTaking()) return;
     this.provider?.cancelResponse();
     this.performInterrupt();
   }
@@ -550,7 +557,36 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
         };
       }),
       providerOptions: this.activeAgentValue.providerOptions,
+      // Providers with `startupHistory` seed this into the new session
+      // (reconnects, handoff-reconnects); the others re-inject it as text.
+      history: this.buildHistory(),
     };
+  }
+
+  /** Whether the connected provider decides turn-taking itself (full-duplex). */
+  private modelOwnsTurnTaking(): boolean {
+    return this.provider?.capabilities.turnTaking === 'model';
+  }
+
+  /** Attributed replay of the call so far, as turns (see buildHistoryForSeeding). */
+  private buildHistory(): ProviderHistoryEntry[] | undefined {
+    if (this.transcriptEntries.length === 0) return undefined;
+    const turns = buildHistoryForSeeding(this.transcriptEntries, {
+      agentNames: new Map([...this.agents].map(([id, agent]) => [id, agent.name])),
+      handoffs: this.handoffHistory,
+    });
+    return [
+      {
+        role: 'developer',
+        text:
+          `Context: this phone call reconnected mid-conversation. You are ${this.activeAgentValue.name}. ` +
+          `The conversation so far follows: assistant lines that name another agent were said by that ` +
+          `agent, and \`[transfer]\` notes are routing that ALREADY happened. Anything already answered ` +
+          `or already routed must not be routed again. Continue naturally from where it left off; ` +
+          `do not greet again.`,
+      },
+      ...turns,
+    ];
   }
 
   private wireTransport(): void {
@@ -567,8 +603,10 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       this.handleKeypress(digit);
       this.emit('dtmf', { digit });
     });
-    transport.on('stop', () => void this.teardown('caller-hangup'));
-    transport.on('close', () => void this.teardown('caller-hangup'));
+    // A stop/close that arrives while we are completing our own hangup is
+    // Twilio confirming the REST completion, not the caller leaving.
+    transport.on('stop', () => void this.teardown(this.stateValue === 'ending' ? this.hangupReason : 'caller-hangup'));
+    transport.on('close', () => void this.teardown(this.stateValue === 'ending' ? this.hangupReason : 'caller-hangup'));
     transport.on('error', (error) => this.emitError(error));
   }
 
@@ -605,7 +643,14 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       this.currentResponseId = responseId;
       this.blockedUserTurn = 'idle'; // something is answering the caller
 
-      if (this.pendingHangup) this.pendingHangup.sawResponse = true;
+      if (this.pendingHangup) {
+        this.pendingHangup.sawResponse = true;
+        if (this.pendingHangup.grace) {
+          clearTimeout(this.pendingHangup.grace);
+          this.timers.delete(this.pendingHangup.grace);
+          this.pendingHangup.grace = null;
+        }
+      }
       this.noteHangupProgress(); // the goodbye began — give it a fresh window
       this.clearIdleTimer();
       this.interruptions.onResponseStarted(responseId);
@@ -684,6 +729,16 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
     provider.on('toolCall', (call) => void this.handleToolCall(call));
 
+    provider.on('usage', (usage) => {
+      // Response-bound providers report usage on responseDone (accounted
+      // there; their `usage` event is for host listeners). A decoupled backend
+      // has no response boundary carrying usage — duration ticks and backend
+      // completions arrive here and only here.
+      if (!provider.capabilities.decoupledBackend) return;
+      const total = this.usageAccumulator.add(usage);
+      this.emit('usage.updated', total, usage);
+    });
+
     provider.on('error', (error) => this.emitError(error));
 
     provider.on('close', (info) => {
@@ -700,7 +755,8 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
   // ---- inbound audio -------------------------------------------------------
 
-  private handleInboundMedia(payload: string): void {
+  private handleInboundMedia(inbound: string): void {
+    let payload = inbound;
     if (this.stateValue === 'ended' || this.stateValue === 'ending') return;
     // The noise meter taps BEFORE the drop-guards below: rate-limiter
     // suspension and first-turn deafness are consequences of noise, so a
@@ -720,11 +776,19 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     // While the pre-synthesized greeting is playing, the provider must not
     // hear the line: server-side VAD would treat greeting bleed/noise as a
     // barge-in on a turn it never generated.
-    if (this.pregreeting && !this.pregreeting.played) return;
-    if (this.deps.options.deafness.ignoreUserAudioUntilFirstTurnDone && !this.firstTurnDone) return;
-    if (this.deps.options.deafness.muteDuringToolExecution && this.runningTools.size > 0) return;
-    if (this.deps.options.deafness.muteWhileAgentSpeaking && this.tracker.isPlaybackActive()) return;
-    if (this.interruptions.isSuspended) return;
+    const deaf =
+      (this.pregreeting !== null && !this.pregreeting.played) ||
+      (this.deps.options.deafness.ignoreUserAudioUntilFirstTurnDone && !this.firstTurnDone) ||
+      (this.deps.options.deafness.muteDuringToolExecution && this.runningTools.size > 0) ||
+      (this.deps.options.deafness.muteWhileAgentSpeaking && this.tracker.isPlaybackActive()) ||
+      this.interruptions.isSuspended;
+    if (deaf) {
+      // A full-duplex model's session clock runs on input audio: dropping
+      // frames would stall its appends (greeting included). Feed it silence
+      // of the same length instead — deaf, but ticking.
+      if (!this.modelOwnsTurnTaking()) return;
+      payload = silenceLike(payload);
+    }
 
     if (this.provider?.isConnected && !this.reconnecting) {
       this.provider.sendAudio(payload);
@@ -736,7 +800,12 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
   private flushInboundBuffer(): void {
     if (!this.provider?.isConnected) return;
-    for (const payload of this.inboundBuffer) this.provider.sendAudio(payload);
+    // A real-time model lives on its own clock: a burst of buffered frames
+    // would arrive faster than time passes. The gap is covered by hold audio
+    // and the seeded history; the frames themselves are dropped.
+    if (!this.modelOwnsTurnTaking()) {
+      for (const payload of this.inboundBuffer) this.provider.sendAudio(payload);
+    }
     this.inboundBuffer = [];
   }
 
@@ -855,6 +924,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
   private handleBargeIn(): void {
     if (!this.generating && !this.tracker.isPlaybackActive()) return;
+    if (this.modelOwnsTurnTaking()) return; // the model already yielded (or chose not to)
     const decision = this.interruptions.evaluate({ toolRunning: this.runningTools.size > 0 });
     if (!decision.allow) {
       // Nothing is cancelled and nothing is cleared: on providers with
@@ -1248,7 +1318,12 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
   /** Inject a text turn now, or after the agent finishes speaking. */
   private injectOrQueueText(text: string, triggerResponse: boolean): void {
-    if (this.generating || this.tracker.isPlaybackActive()) {
+    // A decoupled backend keeps the conversation going while it works —
+    // nothing to wait for, and waiting would only delay the answer.
+    if (
+      !this.provider?.capabilities.decoupledBackend &&
+      (this.generating || this.tracker.isPlaybackActive())
+    ) {
       this.pendingInjections.push({ text, triggerResponse });
       return;
     }
@@ -1277,6 +1352,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     if (this.stateValue === 'ended') return;
     if (
       this.deps.options.toolResultDelivery === 'afterPlayback' &&
+      !this.provider?.capabilities.decoupledBackend &&
       (this.generating || this.tracker.isPlaybackActive())
     ) {
       this.toolQueue.enqueue({ callId, toolName: '', payload, triggerResponse });
@@ -1404,6 +1480,25 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     // farewell and hang up mid-flow. The watchdog covers "no goodbye ever".
     if (!this.pendingHangup.sawResponse) return;
     if (this.generating || this.tracker.isPlaybackActive()) return;
+    if (this.modelOwnsTurnTaking()) {
+      // Utterance boundaries are synthesized from the audio stream, and a
+      // sentence pause can split a goodbye in two (field: 0.9 s pauses,
+      // Sept 2026). Playback evidence still gates completion; this only
+      // waits one gap for the next sentence — a new utterance cancels it.
+      if (this.pendingHangup.grace) return;
+      const timer = setTimeout(() => {
+        this.timers.delete(timer);
+        const pending = this.pendingHangup;
+        if (!pending) return;
+        pending.grace = null;
+        if (this.generating || this.tracker.isPlaybackActive()) return; // the next sentence took over
+        this.completeHangup();
+      }, HANGUP_SENTENCE_GRACE_MS);
+      timer.unref?.();
+      this.timers.add(timer);
+      this.pendingHangup.grace = timer;
+      return;
+    }
     this.completeHangup();
   }
 
@@ -1487,9 +1582,10 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     if (this.stateValue !== 'active') return;
     this.reconnectAttempt = 0;
     this.reconnecting = false;
-    // Session resumption restored context server-side — re-injecting the
+    // Session resumption restored context server-side, and a provider that
+    // seeds `init.history` at connect already has it — re-injecting the
     // transcript would duplicate it.
-    if (!provider.didResume) this.reinjectHistory(provider);
+    if (!provider.didResume && !provider.capabilities.startupHistory) this.reinjectHistory(provider);
     this.flushInboundBuffer();
     this.emit('provider.reconnected');
   }
@@ -1583,7 +1679,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       try {
         await this.provider.close();
         await this.provider.connect({ ...this.buildProviderInit(), freshSession: true });
-        this.reinjectHistory(this.provider);
+        if (!this.provider.capabilities.startupHistory) this.reinjectHistory(this.provider);
         this.provider.createResponse({ instructions: continueInstruction });
       } catch (error) {
         this.handoffInProgress = false;
@@ -1820,6 +1916,8 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 }
 
 const PREGREETING_MARK = 'pre:greeting';
+/** Longer than the speech gate's quiet window plus the mark round trip (0.8 s + ~0.3 s). */
+const HANGUP_SENTENCE_GRACE_MS = 1500;
 /** 400ms per frame — matches production burst-write implementations. */
 const PREGREETING_CHUNK_BYTES = 3200;
 
@@ -1828,6 +1926,15 @@ type ToolOutcome = { ok: true; result: unknown } | { ok: false; payload: unknown
 function toError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
 }
+
+/** Base64 μ-law digital silence with the same byte length as `payload`. */
+function silenceLike(payload: string): string {
+  const bytes = base64ByteLength(payload);
+  if (bytes === SILENCE_FRAME_BYTES) return SILENCE_FRAME_BASE64;
+  return Buffer.alloc(Math.max(0, Math.round(bytes)), MULAW_SILENCE_BYTE).toString('base64');
+}
+const SILENCE_FRAME_BYTES = 160;
+const SILENCE_FRAME_BASE64 = Buffer.alloc(SILENCE_FRAME_BYTES, MULAW_SILENCE_BYTE).toString('base64');
 
 function safeJsonStringify(value: unknown): string {
   try {

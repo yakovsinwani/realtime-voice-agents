@@ -14,7 +14,9 @@ import { pcm16ToMulaw } from '../audio/mulaw.js';
 import { tool } from '../tools/tool.js';
 import { geminiLive } from '../gemini.js';
 import { FakeGeminiLive } from '../testing/FakeGeminiLive.js';
+import { FakeGptLiveServer, mulawToneBase64 } from '../testing/FakeGptLiveServer.js';
 import { FakeOpenAIServer } from '../testing/FakeOpenAIServer.js';
+import { gptLive } from '../gpt-live.js';
 import { FakeTwilioMediaStream } from '../testing/FakeTwilioMediaStream.js';
 import { OpenAICompatibleProvider } from '../providers/openai-compatible/OpenAICompatibleProvider.js';
 import { buildXaiSessionUpdate, xaiRealtime } from '../xai.js';
@@ -396,5 +398,175 @@ describe('provider parity: one config surface', () => {
     expect(content.turns[0]!.parts[0].text).toContain('[keypad] I typed on my phone keypad: 12');
     expect(content.turnComplete).toBe(true); // Gemini's "respond now"
     expect((fakeGemini.latest.params.config as any).systemInstruction).toContain(DEFAULT_KEYPAD_INSTRUCTIONS);
+  });
+});
+
+describe('provider parity: GPT-Live (full-duplex, model-owned turn-taking)', () => {
+  let cleanup: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    for (const fn of cleanup) await fn();
+    cleanup = [];
+  });
+
+  const connect = async (server: FakeGptLiveServer, session: Partial<SessionOptions>, extra: Record<string, unknown> = {}) => {
+    const bridge = new TwilioRealtimeBridge({
+      agent: AGENT,
+      provider: gptLive({ apiKey: 'k', baseUrl: server.url, delegation: { instructions: 'Backend prompt.' } }),
+      session,
+      ...extra,
+    });
+    cleanup.push(async () => {
+      await bridge.close();
+      await server.close();
+    });
+    const fake = new FakeTwilioMediaStream();
+    bridge.handleConnection(fake);
+    fake.connect();
+    await waitFor(() => bridge.getSession(fake.callSid)?.state === 'active');
+    return { bridge, fake, session: bridge.getSession(fake.callSid)! };
+  };
+
+  it('GPT-Live: instructions and voice land on the session, tools on the backend delegation; VAD has no analog and is dropped (documented)', async () => {
+    const server = await FakeGptLiveServer.start();
+    await connect(server, SESSION);
+    const start = server.latest.startFrame!.session;
+    expect(start.instructions).toContain('Shared instructions.');
+    expect(start.audio).toEqual({ format: { type: 'audio/pcmu', rate: 8000 }, output: { voice: 'marin' } });
+    expect(start.delegation.responses.instructions).toBe('Backend prompt.');
+    expect(start.delegation.responses.tools.map((t: any) => t.name)).toContain('shared_tool');
+    // The same SESSION.vad that lands as turn_detection on OpenAI/xAI has no
+    // wire shape here: the model owns turn-taking (strict schema — an unknown
+    // field would reject the session).
+    expect(JSON.stringify(start)).not.toMatch(/turn_detection|interrupt_response|threshold/);
+  });
+
+  it('GPT-Live fallback (documented): the interruption guard is observe-only — interrupt() sends no clear and nothing is cancelled', async () => {
+    const server = await FakeGptLiveServer.start();
+    const { fake, session } = await connect(server, SESSION);
+    const interrupted: unknown[] = [];
+    session.on('playback.interrupted', (e) => interrupted.push(e));
+    // The agent is mid-utterance (speech with no closing silence yet).
+    server.latest.send({ type: 'session.output_audio.delta', delta: mulawToneBase64(100) });
+    await waitFor(() => fake.sentMediaPayloads.length > 0, 2000, 'agent audio at Twilio');
+    session.interrupt();
+    await delay(30);
+    expect(fake.outbound.some((f) => f.event === 'clear')).toBe(false);
+    expect(server.latest.received.some((f) => /cancel|truncate/.test(f.type))).toBe(false);
+    expect(interrupted).toEqual([]);
+  });
+
+  it('GPT-Live: tool results are delivered immediately while the agent is still speaking (decoupled backend)', async () => {
+    const server = await FakeGptLiveServer.start();
+    const { fake, session } = await connect(server, SESSION);
+    const finished: unknown[] = [];
+    session.on('playback.finished', (e) => finished.push(e));
+    server.latest.send({ type: 'session.output_audio.delta', delta: mulawToneBase64(100) });
+    await waitFor(() => fake.sentMediaPayloads.length > 0, 2000, 'agent audio at Twilio');
+    server.latest.sendFunctionCall({ name: 'shared_tool', argumentsJson: '{"q":"x"}' });
+    const item = await server.latest.waitForEvent('response.item.create');
+    expect(JSON.parse(item.item.output)).toEqual({ ok: true });
+    await server.latest.waitForEvent('response.create');
+    // …and nothing had finished playing: the default afterPlayback queue was bypassed.
+    expect(finished).toEqual([]);
+  });
+
+  it('GPT-Live: the greeting is a commentary append and a keypad entry is a thinking append', async () => {
+    const server = await FakeGptLiveServer.start();
+    const { fake } = await connect(server, {
+      greeting: { mode: 'agent-initiates', instructions: 'Open with: "Hello, you reached Acme."' },
+      keypad: { maxDigits: 2 },
+    });
+    await waitFor(() => server.latest.appends.length >= 1, 2000, 'greeting append');
+    expect(server.latest.appends[0]).toEqual({
+      type: 'session.commentary.append',
+      content: 'Open with: "Hello, you reached Acme."',
+      delegation_id: null,
+    });
+    fake.sendDtmf('1');
+    fake.sendDtmf('2');
+    await waitFor(() => server.latest.appends.length >= 2, 2000, 'keypad append');
+    const keypad = server.latest.appends[1]!;
+    expect(keypad.type).toBe('session.thinking.append');
+    expect(keypad.content).toContain('[keypad]');
+    expect(keypad.content).toContain('12');
+    // Typing did not clear Twilio either (model-owned turn-taking).
+    expect(fake.outbound.some((f) => f.event === 'clear')).toBe(false);
+  });
+
+  it('GPT-Live: deafness substitutes silence for caller audio (the session clock must keep ticking)', async () => {
+    const server = await FakeGptLiveServer.start();
+    const { fake } = await connect(server, { greeting: { mode: 'agent-initiates' } }); // first-turn deafness on by default
+    const tone = mulawToneBase64(20);
+    fake.sendMedia(tone);
+    fake.sendMedia(tone);
+    await waitFor(() => server.latest.appendedAudio.length === 2, 2000, 'silence frames');
+    for (const payload of server.latest.appendedAudio) {
+      const bytes = Buffer.from(payload, 'base64');
+      expect(bytes).toHaveLength(160);
+      expect(bytes.every((b) => b === 0xff)).toBe(true);
+    }
+    // First turn plays out → the line opens up and caller audio passes untouched.
+    server.latest.sendSpeech({ chunks: [mulawToneBase64(100)], silenceMs: 1000 });
+    await waitFor(() => fake.sentMediaPayloads.length > 0, 2000, 'agent audio');
+    fake.playAll();
+    await delay(50);
+    fake.sendMedia(tone);
+    await waitFor(() => server.latest.appendedAudio.length === 3, 2000, 'caller frame');
+    expect(server.latest.appendedAudio[2]).toBe(tone);
+  });
+
+  it('GPT-Live: duration ticks are a running total, backend tokens are summed', async () => {
+    const server = await FakeGptLiveServer.start();
+    const { session } = await connect(server, SESSION);
+    server.latest.sendUsage(14);
+    server.latest.sendUsage(29);
+    server.latest.sendBackendCompleted({ usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 } });
+    await waitFor(() => session.usage.responses === 1, 2000, 'backend usage');
+    expect(session.usage.audioSeconds).toBe(29);
+    expect(session.usage.inputTokens).toBe(100);
+    expect(session.usage.totalTokens).toBe(110);
+  });
+
+  it('GPT-Live: finish_call is a backend tool; the call ends after the goodbye plays out and the session is closed', async () => {
+    const server = await FakeGptLiveServer.start();
+    const { fake, session } = await connect(server, SESSION, { builtinTools: { finishCall: true } });
+    const ended: string[] = [];
+    session.on('call.ended', (e) => ended.push(e.reason));
+    server.latest.sendFunctionCall({ name: 'finish_call', argumentsJson: '{"reason":"done"}' });
+    const result = await server.latest.waitForEvent('response.item.create');
+    expect(JSON.parse(result.item.output).status).toBe('ending_call');
+    // The backend's goodbye is spoken by the voice model…
+    server.latest.sendSpeech({ chunks: [mulawToneBase64(200)], silenceMs: 1000 });
+    await waitFor(() => fake.sentMediaPayloads.length > 0, 2000, 'goodbye audio');
+    fake.playAll();
+    // …and only once it has played does the call complete, closing the Live session.
+    await waitFor(() => ended.length === 1, 5000, 'call ended');
+    expect(ended[0]).toBe('agent-hangup');
+    await waitFor(() => server.latest.eventsOfType('session.close').length === 1, 2000, 'session.close');
+  });
+
+  it('GPT-Live: a goodbye split at a sentence pause does not end the call between its sentences', async () => {
+    const server = await FakeGptLiveServer.start();
+    const { fake, session } = await connect(server, SESSION, { builtinTools: { finishCall: true } });
+    const ended: string[] = [];
+    session.on('call.ended', (e) => ended.push(e.reason));
+    server.latest.sendFunctionCall({ name: 'finish_call' });
+    await server.latest.waitForEvent('response.item.create');
+    // Sentence one plays out and closes the gate (the stream carried a pause).
+    server.latest.sendSpeech({ chunks: [mulawToneBase64(200)], silenceMs: 1000 });
+    await waitFor(() => fake.sentMediaPayloads.length > 0, 2000, 'sentence one');
+    fake.playAll();
+    await delay(400); // inside the grace window: still on the call
+    expect(session.state).not.toBe('ended');
+    // Sentence two arrives — the grace is cancelled and its playout gates completion again.
+    const before = fake.sentMediaPayloads.length;
+    server.latest.sendSpeech({ chunks: [mulawToneBase64(200)], silenceMs: 1000 });
+    await waitFor(() => fake.sentMediaPayloads.length > before, 2000, 'sentence two');
+    await delay(1300);
+    expect(ended).toEqual([]); // sentence two has not played yet — no completion despite the elapsed grace
+    fake.playAll();
+    await waitFor(() => ended.length === 1, 5000, 'call ended after sentence two');
+    expect(ended[0]).toBe('agent-hangup');
   });
 });

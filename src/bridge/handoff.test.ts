@@ -8,6 +8,8 @@ import { tool } from '../tools/tool.js';
 import { geminiLive } from '../gemini.js';
 import { captureGreetingAudio } from '../greeting/capture.js';
 import { FakeGeminiLive } from '../testing/FakeGeminiLive.js';
+import { FakeGptLiveServer, mulawToneBase64 } from '../testing/FakeGptLiveServer.js';
+import { gptLive } from '../gpt-live.js';
 import { FakeOpenAIServer } from '../testing/FakeOpenAIServer.js';
 import { FakeTwilioMediaStream, mulawSilenceBase64 } from '../testing/FakeTwilioMediaStream.js';
 import { OpenAICompatibleProvider } from '../providers/openai-compatible/OpenAICompatibleProvider.js';
@@ -290,6 +292,50 @@ describe('multi-agent handoffs (Gemini path: reconnect + context carry)', () => 
     expect(replay).not.toContain('Agent: Let me get billing.');
 
     await bridge.close();
+  });
+});
+
+describe('multi-agent handoffs (GPT-Live path: reconnect + history seeded at start)', () => {
+  it('reopens with the new agent and seeds the attributed transcript via session.input instead of re-injecting text', async () => {
+    const server = await FakeGptLiveServer.start();
+    const { receptionist } = makeAgents();
+    const bridge = new TwilioRealtimeBridge({
+      agent: receptionist,
+      provider: gptLive({ apiKey: 'k', baseUrl: server.url }),
+      session: { greeting: { mode: 'user-initiates' } },
+    });
+    const fake = new FakeTwilioMediaStream();
+    bridge.handleConnection(fake);
+    fake.connect();
+    await waitFor(() => bridge.getSession(fake.callSid)?.state === 'active', 2000, 'active');
+    const session = bridge.getSession(fake.callSid)!;
+
+    server.latest.sendInputTranscript('I need a refund on invoice 12', { startMs: 1000, endMs: 2000 });
+    server.latest.sendSpeech({ chunks: [mulawToneBase64(100)], transcript: 'Let me get billing.', startMs: 4000 });
+    await waitFor(() => session.transcript.length === 2, 3000, 'transcript');
+
+    server.latest.sendFunctionCall({ name: 'transfer_to_billing', argumentsJson: '{"reason":"refund request"}' });
+    await waitFor(() => session.activeAgent.id === 'billing', 3000, 'handoff');
+    await waitFor(() => server.connections.length === 2, 2000, 'second session');
+    const second = server.latest;
+    await second.waitForEvent('session.start');
+    const start = second.startFrame!.session;
+    expect(start.instructions).toContain('invoices and payments');
+    const input: Array<{ role: string; content: Array<{ text: string }> }> = start.input;
+    const lines = input.map((m) => `${m.role}: ${m.content[0]!.text}`);
+    // The receiving agent sees who said what and that the routing already happened…
+    expect(lines[0]).toMatch(/^developer: Context: this phone call reconnected/);
+    expect(lines).toContain('user: I need a refund on invoice 12');
+    expect(lines).toContain('assistant: Receptionist: Let me get billing.');
+    expect(lines).toContain('developer: [transfer] Receptionist -> Billing Department (reason: refund request)');
+    // …seeded at start, not appended after: the only append is the continuation.
+    await waitFor(() => second.appends.length >= 1, 2000, 'continuation');
+    expect(second.appends).toHaveLength(1);
+    expect(second.appends[0]!.type).toBe('session.commentary.append');
+    expect(second.appends[0]!.content).toContain('You are now Billing Department');
+
+    await bridge.close();
+    await server.close();
   });
 });
 
