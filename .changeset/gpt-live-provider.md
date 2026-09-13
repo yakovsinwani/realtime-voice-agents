@@ -13,3 +13,8 @@ Engine changes for full-duplex providers (all additive, capability-gated):
 - `ProviderCapabilities.decoupledBackend` — tool results and deferred injections bypass the after-playback queue; usage arrives from the provider's `usage` events.
 - `ProviderUsage.audioSeconds` / `UsageInfo.audioSeconds` — a running duration total for per-second-billed providers.
 - `FakeGptLiveServer` in `realtime-voice-agents/testing` (speech + closing silence, timed transcripts, backend function calls, usage ticks, server-side closes).
+
+Fixes surfaced by the field test (all providers):
+
+- `TypedEmitter.removeAllListeners()` with no argument now detaches every listener (Node treats an explicit `undefined` as an event name, so a detached provider kept reaching the session — e.g. a `usage.updated` after `call.ended`).
+- `call.ended.reason` is `agent-hangup` when Twilio's `stop` confirms our own REST completion (it raced the REST callback and was reported as `caller-hangup`).

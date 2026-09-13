@@ -144,6 +144,8 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     progress: number;
     /** `progress` at the last watchdog check — no movement for a window = dead leg. */
     progressAtCheck: number;
+    /** Model-owned turn-taking: one-gap wait for the goodbye's next sentence. */
+    grace?: NodeJS.Timeout | null;
   } | null = null;
   private pendingTransfer: { phoneNumber: string; callerId?: string } | null = null;
   private endedReason: CallEndReason | null = null;
@@ -601,8 +603,10 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       this.handleKeypress(digit);
       this.emit('dtmf', { digit });
     });
-    transport.on('stop', () => void this.teardown('caller-hangup'));
-    transport.on('close', () => void this.teardown('caller-hangup'));
+    // A stop/close that arrives while we are completing our own hangup is
+    // Twilio confirming the REST completion, not the caller leaving.
+    transport.on('stop', () => void this.teardown(this.stateValue === 'ending' ? this.hangupReason : 'caller-hangup'));
+    transport.on('close', () => void this.teardown(this.stateValue === 'ending' ? this.hangupReason : 'caller-hangup'));
     transport.on('error', (error) => this.emitError(error));
   }
 
@@ -639,7 +643,14 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
       this.currentResponseId = responseId;
       this.blockedUserTurn = 'idle'; // something is answering the caller
 
-      if (this.pendingHangup) this.pendingHangup.sawResponse = true;
+      if (this.pendingHangup) {
+        this.pendingHangup.sawResponse = true;
+        if (this.pendingHangup.grace) {
+          clearTimeout(this.pendingHangup.grace);
+          this.timers.delete(this.pendingHangup.grace);
+          this.pendingHangup.grace = null;
+        }
+      }
       this.noteHangupProgress(); // the goodbye began — give it a fresh window
       this.clearIdleTimer();
       this.interruptions.onResponseStarted(responseId);
@@ -1469,6 +1480,25 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     // farewell and hang up mid-flow. The watchdog covers "no goodbye ever".
     if (!this.pendingHangup.sawResponse) return;
     if (this.generating || this.tracker.isPlaybackActive()) return;
+    if (this.modelOwnsTurnTaking()) {
+      // Utterance boundaries are synthesized from the audio stream, and a
+      // sentence pause can split a goodbye in two (field: 0.9 s pauses,
+      // Sept 2026). Playback evidence still gates completion; this only
+      // waits one gap for the next sentence — a new utterance cancels it.
+      if (this.pendingHangup.grace) return;
+      const timer = setTimeout(() => {
+        this.timers.delete(timer);
+        const pending = this.pendingHangup;
+        if (!pending) return;
+        pending.grace = null;
+        if (this.generating || this.tracker.isPlaybackActive()) return; // the next sentence took over
+        this.completeHangup();
+      }, HANGUP_SENTENCE_GRACE_MS);
+      timer.unref?.();
+      this.timers.add(timer);
+      this.pendingHangup.grace = timer;
+      return;
+    }
     this.completeHangup();
   }
 
@@ -1886,6 +1916,8 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 }
 
 const PREGREETING_MARK = 'pre:greeting';
+/** Longer than the speech gate's quiet window plus the mark round trip (0.8 s + ~0.3 s). */
+const HANGUP_SENTENCE_GRACE_MS = 1500;
 /** 400ms per frame — matches production burst-write implementations. */
 const PREGREETING_CHUNK_BYTES = 3200;
 

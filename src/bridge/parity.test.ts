@@ -541,8 +541,32 @@ describe('provider parity: GPT-Live (full-duplex, model-owned turn-taking)', () 
     await waitFor(() => fake.sentMediaPayloads.length > 0, 2000, 'goodbye audio');
     fake.playAll();
     // …and only once it has played does the call complete, closing the Live session.
-    await waitFor(() => ended.length === 1, 3000, 'call ended');
+    await waitFor(() => ended.length === 1, 5000, 'call ended');
     expect(ended[0]).toBe('agent-hangup');
     await waitFor(() => server.latest.eventsOfType('session.close').length === 1, 2000, 'session.close');
+  });
+
+  it('GPT-Live: a goodbye split at a sentence pause does not end the call between its sentences', async () => {
+    const server = await FakeGptLiveServer.start();
+    const { fake, session } = await connect(server, SESSION, { builtinTools: { finishCall: true } });
+    const ended: string[] = [];
+    session.on('call.ended', (e) => ended.push(e.reason));
+    server.latest.sendFunctionCall({ name: 'finish_call' });
+    await server.latest.waitForEvent('response.item.create');
+    // Sentence one plays out and closes the gate (the stream carried a pause).
+    server.latest.sendSpeech({ chunks: [mulawToneBase64(200)], silenceMs: 1000 });
+    await waitFor(() => fake.sentMediaPayloads.length > 0, 2000, 'sentence one');
+    fake.playAll();
+    await delay(400); // inside the grace window: still on the call
+    expect(session.state).not.toBe('ended');
+    // Sentence two arrives — the grace is cancelled and its playout gates completion again.
+    const before = fake.sentMediaPayloads.length;
+    server.latest.sendSpeech({ chunks: [mulawToneBase64(200)], silenceMs: 1000 });
+    await waitFor(() => fake.sentMediaPayloads.length > before, 2000, 'sentence two');
+    await delay(1300);
+    expect(ended).toEqual([]); // sentence two has not played yet — no completion despite the elapsed grace
+    fake.playAll();
+    await waitFor(() => ended.length === 1, 5000, 'call ended after sentence two');
+    expect(ended[0]).toBe('agent-hangup');
   });
 });
