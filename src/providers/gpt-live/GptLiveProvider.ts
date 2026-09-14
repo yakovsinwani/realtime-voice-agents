@@ -500,15 +500,25 @@ export class GptLiveProvider extends BaseRealtimeProvider {
     const wasOpen = this.gate.isOpen;
     const events = this.gate.feed(bytes);
     let forwardId = wasOpen ? this.currentUtteranceId : null;
-    let close: { utteranceMs: number } | null = null;
+    // Gate events apply in order. The quiet window can end and speech resume
+    // inside one delta (close, then open): the close must end the utterance
+    // that was open BEFORE the next one begins — ending the new one instead
+    // left the old track open for the rest of the call and wedged every
+    // playback-gated step behind it (field, Sept 2026). The delta itself is
+    // attributed to whichever utterance is open when it ends.
+    let pendingClose = false;
     for (const gateEvent of events) {
-      if (gateEvent.type === 'open') {
-        this.beginUtterance();
-        forwardId = this.currentUtteranceId;
-        this.armPlayoutLead();
-      } else {
-        close = gateEvent;
+      if (gateEvent.type === 'close') {
+        pendingClose = true;
+        continue;
       }
+      if (pendingClose) {
+        this.endUtterance();
+        pendingClose = false;
+      }
+      this.beginUtterance();
+      forwardId = this.currentUtteranceId;
+      this.armPlayoutLead();
     }
     if (forwardId) {
       this.forwardAudio(delta, bytes.length / MULAW_BYTES_PER_MS, forwardId);
@@ -518,7 +528,7 @@ export class GptLiveProvider extends BaseRealtimeProvider {
       // Kept as pre-roll: a soft onset that began in it is not clipped.
       this.preRoll = { delta, ms: bytes.length / MULAW_BYTES_PER_MS };
     }
-    if (close) this.endUtterance();
+    if (pendingClose) this.endUtterance();
     else if (this.gate.isOpen) this.armGateStall();
   }
 
@@ -594,6 +604,8 @@ export class GptLiveProvider extends BaseRealtimeProvider {
   // ---- utterances (synthesized response boundaries) -----------------------
 
   private beginUtterance(): void {
+    // Never leave an utterance open behind a new one: its track would never finish.
+    if (this.currentUtteranceId) this.endUtterance();
     this.currentUtteranceId = `live_utt_${++this.utteranceCounter}`;
     this.lastUtteranceId = this.currentUtteranceId;
     this.emit('responseStarted', { responseId: this.currentUtteranceId });

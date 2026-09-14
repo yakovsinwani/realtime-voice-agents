@@ -2022,8 +2022,13 @@ const PREGREETING_MARK = 'pre:greeting';
 /** Longer than the speech gate's quiet window plus the mark round trip (0.8 s + ~0.3 s). */
 /** Model-owned turn-taking: the gate can split one sentence at a pause — wait one gap for the next. */
 const SENTENCE_GRACE_MS = 1500;
-/** A deferred handoff runs no later than this after the transfer landed, even mid-utterance. */
-const HANDOFF_DEFER_MAX_MS = 5000;
+/**
+ * A deferred handoff runs no later than this after the transfer landed, even
+ * mid-utterance. One announce + a stray utterance + the sentence grace lands
+ * right at 5 s in the field (Sept 2026); the cap is for a voice that never
+ * stops, and the caller hears the agent meanwhile, so it errs long.
+ */
+const HANDOFF_DEFER_MAX_MS = 8000;
 /** 400ms per frame — matches production burst-write implementations. */
 const PREGREETING_CHUNK_BYTES = 3200;
 
