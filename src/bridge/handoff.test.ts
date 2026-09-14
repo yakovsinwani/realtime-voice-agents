@@ -301,7 +301,7 @@ describe('multi-agent handoffs (GPT-Live path: reconnect + history seeded at sta
     const { receptionist } = makeAgents();
     const bridge = new TwilioRealtimeBridge({
       agent: receptionist,
-      provider: gptLive({ apiKey: 'k', baseUrl: server.url }),
+      provider: gptLive({ apiKey: 'k', baseUrl: server.url, playoutLeadMs: 0 }),
       session: { greeting: { mode: 'user-initiates' } },
     });
     const fake = new FakeTwilioMediaStream();
@@ -345,7 +345,7 @@ describe('multi-agent handoffs (GPT-Live path: reconnect + history seeded at sta
     const { receptionist } = makeAgents();
     const bridge = new TwilioRealtimeBridge({
       agent: receptionist,
-      provider: gptLive({ apiKey: 'k', baseUrl: server.url }),
+      provider: gptLive({ apiKey: 'k', baseUrl: server.url, playoutLeadMs: 0 }),
       session: { greeting: { mode: 'user-initiates' }, handoffHold: { spec: 'ringing', startDelayMs: 0 } },
     });
     const fake = new FakeTwilioMediaStream();

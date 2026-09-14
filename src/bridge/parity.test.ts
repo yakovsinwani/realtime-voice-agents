@@ -412,7 +412,8 @@ describe('provider parity: GPT-Live (full-duplex, model-owned turn-taking)', () 
   const connect = async (server: FakeGptLiveServer, session: Partial<SessionOptions>, extra: Record<string, unknown> = {}) => {
     const bridge = new TwilioRealtimeBridge({
       agent: AGENT,
-      provider: gptLive({ apiKey: 'k', baseUrl: server.url, delegation: { instructions: 'Backend prompt.' } }),
+      // playoutLeadMs: 0 pins the raw wire behavior; the lead has its own test below.
+      provider: gptLive({ apiKey: 'k', baseUrl: server.url, playoutLeadMs: 0, delegation: { instructions: 'Backend prompt.' } }),
       session,
       ...extra,
     });
@@ -606,5 +607,30 @@ describe('provider parity: GPT-Live (full-duplex, model-owned turn-taking)', () 
     await waitFor(() => ended.length === 1, 5000, 'call ended');
     expect(ended[0]).toBe('agent-hangup');
     expect(Date.now() - t0).toBeLessThan(4000); // the 7 s watchdog was not what ended it
+  });
+
+  it('GPT-Live: the default playout lead reaches Twilio as one burst, so the line keeps a cushion against jitter', async () => {
+    const server = await FakeGptLiveServer.start();
+    const bridge = new TwilioRealtimeBridge({
+      agent: AGENT,
+      provider: gptLive({ apiKey: 'k', baseUrl: server.url }), // default playoutLeadMs (200)
+      session: SESSION,
+    });
+    cleanup.push(async () => {
+      await bridge.close();
+      await server.close();
+    });
+    const fake = new FakeTwilioMediaStream();
+    bridge.handleConnection(fake);
+    fake.connect();
+    await waitFor(() => bridge.getSession(fake.callSid)?.state === 'active');
+    const tone = mulawToneBase64(100);
+    server.latest.send({ type: 'session.output_audio.delta', delta: tone });
+    await delay(80);
+    expect(fake.sentMediaPayloads).toEqual([]); // 100 ms held: nothing at Twilio yet
+    server.latest.send({ type: 'session.output_audio.delta', delta: tone });
+    await waitFor(() => fake.sentMediaPayloads.length === 2, 2000, 'lead burst'); // 200 ms → both at once
+    server.latest.send({ type: 'session.output_audio.delta', delta: tone });
+    await waitFor(() => fake.sentMediaPayloads.length === 3, 2000, 'streamed through');
   });
 });

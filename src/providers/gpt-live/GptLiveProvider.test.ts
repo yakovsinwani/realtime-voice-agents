@@ -20,7 +20,8 @@ describe('GptLiveProvider', () => {
   let provider: GptLiveProvider;
 
   const makeProvider = (overrides: Partial<ConstructorParameters<typeof GptLiveProvider>[0]> = {}) =>
-    new GptLiveProvider({ apiKey: 'sk-test', model: 'gpt-live-1', voice: 'marin', baseUrl: server.url, ...overrides });
+    // playoutLeadMs: 0 pins the raw wire behavior; the lead has its own tests below.
+    new GptLiveProvider({ apiKey: 'sk-test', model: 'gpt-live-1', voice: 'marin', baseUrl: server.url, playoutLeadMs: 0, ...overrides });
 
   beforeEach(async () => {
     server = await FakeGptLiveServer.start();
@@ -98,6 +99,37 @@ describe('GptLiveProvider', () => {
     provider.on('responseDone', ({ responseId }) => events.push(responseId));
     server.latest.send({ type: 'session.output_audio.delta', delta: mulawToneBase64(100) });
     await waitFor(() => events.length === 1, 2000, 'stall close'); // no more deltas: 100 + 500 ms stall window
+  });
+
+  it('playout lead: holds the first playoutLeadMs of an utterance (pre-roll included), then streams through', async () => {
+    provider = makeProvider({ playoutLeadMs: 300 });
+    await provider.connect({ instructions: 'x' });
+    const audio: string[] = [];
+    provider.on('audio', (d) => audio.push(d.base64Mulaw));
+    const idle = mulawSilenceDeltas(100)[0]!;
+    const tone = mulawToneBase64(100);
+
+    server.latest.send({ type: 'session.output_audio.delta', delta: idle }); // idle → pre-roll
+    server.latest.send({ type: 'session.output_audio.delta', delta: tone }); // onset: 100 pre-roll + 100 = 200 < 300
+    await delay(60);
+    expect(audio).toEqual([]);
+    server.latest.send({ type: 'session.output_audio.delta', delta: tone }); // 300 ≥ 300 → flush, in order
+    await waitFor(() => audio.length === 3, 2000, 'lead flushed');
+    expect(audio).toEqual([idle, tone, tone]);
+    server.latest.send({ type: 'session.output_audio.delta', delta: tone }); // past the lead: straight through
+    await waitFor(() => audio.length === 4, 2000, 'streamed through');
+  });
+
+  it('playout lead: an utterance shorter than the lead is flushed whole at its close, before responseDone', async () => {
+    provider = makeProvider({ playoutLeadMs: 5000 });
+    await provider.connect({ instructions: 'x' });
+    const order: string[] = [];
+    provider.on('audio', () => order.push('audio'));
+    provider.on('responseDone', () => order.push('done'));
+    server.latest.sendSpeech({ chunks: [mulawToneBase64(100)], silenceMs: 1000 }); // 100 speech + 800 quiet closes the gate
+    await waitFor(() => order.includes('done'), 2000, 'utterance closed');
+    expect(order.indexOf('done')).toBe(order.length - 1);
+    expect(order.filter((e) => e === 'audio').length).toBeGreaterThanOrEqual(2); // the speech and the quiet up to the close
   });
 
   it('groups transcript fragments into turns; agent turns carry the utterance id', async () => {
