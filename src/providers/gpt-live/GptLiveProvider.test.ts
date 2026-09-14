@@ -101,6 +101,26 @@ describe('GptLiveProvider', () => {
     await waitFor(() => events.length === 1, 2000, 'stall close'); // no more deltas: 100 + 500 ms stall window
   });
 
+  it('a close and a reopen inside one delta end the old utterance first and start a new one (no utterance left open)', async () => {
+    provider = makeProvider({ speechGate: { quietMs: 100 } });
+    await provider.connect({ instructions: 'x' });
+    const events: string[] = [];
+    const audio: string[] = [];
+    provider.on('responseStarted', ({ responseId }) => events.push(`start:${responseId}`));
+    provider.on('responseDone', ({ responseId }) => events.push(`done:${responseId}`));
+    provider.on('audio', (d) => audio.push(d.responseId));
+    // One delta: 60 ms speech, 120 ms quiet (≥ quietMs → close), 60 ms speech (→ open).
+    const composite = Buffer.concat([
+      Buffer.from(mulawToneBase64(60), 'base64'),
+      ...mulawSilenceDeltas(120).map((d) => Buffer.from(d, 'base64')),
+      Buffer.from(mulawToneBase64(60), 'base64'),
+    ]).toString('base64');
+    server.latest.send({ type: 'session.output_audio.delta', delta: composite });
+    await waitFor(() => events.length === 4, 2000, 'both utterances closed'); // utt_2 closes on the stall fallback
+    expect(events).toEqual(['start:live_utt_1', 'done:live_utt_1', 'start:live_utt_2', 'done:live_utt_2']);
+    expect(audio).toEqual(['live_utt_2']); // the delta carries the onset: it belongs to the new utterance
+  });
+
   it('playout lead: holds the first playoutLeadMs of an utterance (pre-roll included), then streams through', async () => {
     provider = makeProvider({ playoutLeadMs: 300 });
     await provider.connect({ instructions: 'x' });

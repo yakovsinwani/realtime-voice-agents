@@ -633,4 +633,50 @@ describe('provider parity: GPT-Live (full-duplex, model-owned turn-taking)', () 
     server.latest.send({ type: 'session.output_audio.delta', delta: tone });
     await waitFor(() => fake.sentMediaPayloads.length === 3, 2000, 'streamed through');
   });
+
+  it('GPT-Live: a gate close-and-reopen inside one delta does not leave playback wedged — finish_call still completes via the grace', async () => {
+    const server = await FakeGptLiveServer.start();
+    const bridge = new TwilioRealtimeBridge({
+      agent: AGENT,
+      provider: gptLive({ apiKey: 'k', baseUrl: server.url, playoutLeadMs: 0, speechGate: { quietMs: 100 } }),
+      session: SESSION,
+      builtinTools: { finishCall: true },
+    });
+    cleanup.push(async () => {
+      await bridge.close();
+      await server.close();
+    });
+    const fake = new FakeTwilioMediaStream();
+    bridge.handleConnection(fake);
+    fake.connect();
+    await waitFor(() => bridge.getSession(fake.callSid)?.state === 'active');
+    const session = bridge.getSession(fake.callSid)!;
+    const started: string[] = [];
+    const finishedUtterances: string[] = [];
+    const ended: string[] = [];
+    session.on('agent.speech.started', (e) => started.push(e.responseId));
+    session.on('agent.speech.ended', (e) => finishedUtterances.push(e.responseId));
+    session.on('call.ended', (e) => ended.push(e.reason));
+    // Speech, ≥ quietMs of quiet, speech — all in one delta (field: utt_9 was left open forever).
+    const composite = Buffer.concat([
+      Buffer.from(mulawToneBase64(60), 'base64'),
+      Buffer.alloc(120 * 8, 0xff),
+      Buffer.from(mulawToneBase64(60), 'base64'),
+    ]).toString('base64');
+    server.latest.send({ type: 'session.output_audio.delta', delta: composite });
+    await waitFor(() => started.length === 2, 2000, 'two utterances');
+    // The second utterance closes on the stall fallback; only then does its tail mark exist to play out.
+    await waitFor(() => finishedUtterances.length === 2, 2000, 'both utterances ended');
+    fake.playAll();
+    // Now hang up: with a wedged tracker the grace never arms and only the 7 s watchdog ends the call.
+    server.latest.sendFunctionCall({ name: 'finish_call' });
+    await server.latest.waitForEvent('response.item.create');
+    server.latest.sendSpeech({ chunks: [mulawToneBase64(200)], silenceMs: 1000 });
+    await waitFor(() => finishedUtterances.length === 3, 2000, 'goodbye ended');
+    fake.playAll();
+    const t0 = Date.now();
+    await waitFor(() => ended.length === 1, 5000, 'call ended');
+    expect(ended[0]).toBe('agent-hangup');
+    expect(Date.now() - t0).toBeLessThan(4000);
+  });
 });
