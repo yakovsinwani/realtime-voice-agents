@@ -74,6 +74,14 @@ export interface GptLiveProviderConfig {
   connectTimeoutMs?: number;
   /** How long `close()` waits for `session.closed` (final usage) before dropping the socket. Default 3000. */
   closeTimeoutMs?: number;
+  /**
+   * Audio held back at the start of each utterance before forwarding begins,
+   * so Twilio keeps that much cushion against delivery jitter (the stream is
+   * real-time paced — without it any hiccup is an audible gap). The last idle
+   * delta before the onset is included, so soft onsets are not clipped.
+   * Default 200; 0 forwards every delta as it arrives.
+   */
+  playoutLeadMs?: number;
   /** Speech gate tuning (utterance boundaries synthesized from the audio). */
   speechGate?: SpeechGateOptions;
   /** Session-timeline gap that splits transcript fragments into turns. Default 800. */
@@ -91,6 +99,8 @@ const NON_RETRIABLE_CLOSE_CODES = new Set([1002, 1003, 1007, 1008]);
 const APPEND_MAX_CHARS = 1200;
 const TRANSCRIPT_IDLE_EXTRA_MS = 300;
 const GATE_STALL_EXTRA_MS = 500;
+export const DEFAULT_PLAYOUT_LEAD_MS = 200;
+const MULAW_BYTES_PER_MS = 8;
 
 type AppendType = 'session.instructions.append' | 'session.thinking.append' | 'session.commentary.append';
 
@@ -140,6 +150,10 @@ export class GptLiveProvider extends BaseRealtimeProvider {
 
   private readonly gate: SpeechGate;
   private gateStallTimer: NodeJS.Timeout | null = null;
+  /** Deltas of the current utterance held until the playout lead has accumulated. */
+  private lead: { pending: string[]; pendingMs: number } | null = null;
+  /** The last idle delta: becomes the utterance's pre-roll when the gate opens. */
+  private preRoll: { delta: string; ms: number } | null = null;
   private utteranceCounter = 0;
   private currentUtteranceId: string | null = null;
   private lastUtteranceId: string | null = null;
@@ -288,6 +302,8 @@ export class GptLiveProvider extends BaseRealtimeProvider {
     this.inputTranscript.dispose();
     this.outputTranscript.dispose();
     this.clearGateStall();
+    this.lead = null;
+    this.preRoll = null;
     if (!ws || ws.readyState === WebSocket.CLOSED) return;
     // Graceful: session.close → session.closed carries the confirmed final
     // usage. The socket is dropped regardless once the wait runs out — a
@@ -489,15 +505,63 @@ export class GptLiveProvider extends BaseRealtimeProvider {
       if (gateEvent.type === 'open') {
         this.beginUtterance();
         forwardId = this.currentUtteranceId;
+        this.armPlayoutLead();
       } else {
         close = gateEvent;
       }
     }
-    // Silence between utterances is the model's idle stream — not agent
-    // speech, not marked, not forwarded (Twilio plays nothing = silence).
-    if (forwardId) this.emit('audio', { base64Mulaw: delta, responseId: forwardId });
+    if (forwardId) {
+      this.forwardAudio(delta, bytes.length / MULAW_BYTES_PER_MS, forwardId);
+    } else {
+      // Silence between utterances is the model's idle stream — not agent
+      // speech, not marked, not forwarded (Twilio plays nothing = silence).
+      // Kept as pre-roll: a soft onset that began in it is not clipped.
+      this.preRoll = { delta, ms: bytes.length / MULAW_BYTES_PER_MS };
+    }
     if (close) this.endUtterance();
     else if (this.gate.isOpen) this.armGateStall();
+  }
+
+  /**
+   * The stream is real-time paced, so Twilio's buffer never runs ahead of
+   * playout and every delivery hiccup between the model, this server and
+   * Twilio is an audible gap (field, Sept 2026: "slightly choppy"). Hold the
+   * first `playoutLeadMs` of each utterance — the last idle delta included —
+   * then flush and stream through: Twilio keeps that much cushion for the
+   * rest of the utterance, at the cost of that much latency on its first word.
+   */
+  private armPlayoutLead(): void {
+    if (this.playoutLeadMs() <= 0) {
+      this.preRoll = null;
+      return;
+    }
+    this.lead = { pending: [], pendingMs: 0 };
+    if (this.preRoll) {
+      this.lead.pending.push(this.preRoll.delta);
+      this.lead.pendingMs += this.preRoll.ms;
+      this.preRoll = null;
+    }
+  }
+
+  private forwardAudio(delta: string, ms: number, responseId: string): void {
+    if (!this.lead) {
+      this.emit('audio', { base64Mulaw: delta, responseId });
+      return;
+    }
+    this.lead.pending.push(delta);
+    this.lead.pendingMs += ms;
+    if (this.lead.pendingMs >= this.playoutLeadMs()) this.flushPlayoutLead(responseId);
+  }
+
+  private flushPlayoutLead(responseId: string): void {
+    const lead = this.lead;
+    if (!lead) return;
+    this.lead = null;
+    for (const delta of lead.pending) this.emit('audio', { base64Mulaw: delta, responseId });
+  }
+
+  private playoutLeadMs(): number {
+    return this.config.playoutLeadMs ?? DEFAULT_PLAYOUT_LEAD_MS;
   }
 
   private handleBackendEvent(inner: Record<string, any>, delegationId: string | undefined): void {
@@ -538,6 +602,8 @@ export class GptLiveProvider extends BaseRealtimeProvider {
   private endUtterance(): void {
     this.clearGateStall();
     const id = this.currentUtteranceId;
+    // An utterance shorter than the lead still goes out whole, before its done.
+    if (id) this.flushPlayoutLead(id);
     this.currentUtteranceId = null;
     if (id) this.emit('responseDone', { responseId: id });
   }
@@ -570,6 +636,8 @@ export class GptLiveProvider extends BaseRealtimeProvider {
   private resetUtteranceState(): void {
     this.clearGateStall();
     this.gate.close();
+    this.lead = null;
+    this.preRoll = null;
     this.currentUtteranceId = null;
     this.lastUtteranceId = null;
     this.seenCalls.clear();

@@ -65,6 +65,14 @@ export interface GptLiveOptions {
   /** Provider-native `session.start` fields, deep-merged last. The schema is strict: an unknown field rejects the session. */
   sessionOptions?: Record<string, unknown>;
   connectTimeoutMs?: number;
+  /**
+   * Cushion held at the start of each utterance before audio is forwarded to
+   * Twilio. The model streams at exactly real-time pace, so without it any
+   * delivery hiccup is an audible gap; with it Twilio stays that far ahead of
+   * playout. Costs the same amount of latency on each turn's first word.
+   * Default 200; 0 forwards every delta as it arrives.
+   */
+  playoutLeadMs?: number;
   /** Speech gate tuning — utterance boundaries synthesized from the continuous output stream. */
   speechGate?: SpeechGateOptions;
   /** Session-timeline gap that splits transcript fragments into turns. Default 800. */
@@ -88,6 +96,7 @@ export function gptLive(options: GptLiveOptions = {}): ProviderFactory {
     store: options.store,
     extraSessionOptions: options.sessionOptions,
     connectTimeoutMs: options.connectTimeoutMs,
+    playoutLeadMs: options.playoutLeadMs,
     speechGate: options.speechGate,
     transcriptGapMs: options.transcriptGapMs,
   };
@@ -103,6 +112,7 @@ export function gptLive(options: GptLiveOptions = {}): ProviderFactory {
 export {
   GptLiveProvider,
   GPT_LIVE_DEFAULT_BASE_URL,
+  DEFAULT_PLAYOUT_LEAD_MS,
   splitForAppend,
   type GptLiveProviderConfig,
 } from './providers/gpt-live/GptLiveProvider.js';
