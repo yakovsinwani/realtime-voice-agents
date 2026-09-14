@@ -496,7 +496,11 @@ describe('provider parity: GPT-Live (full-duplex, model-owned turn-taking)', () 
 
   it('GPT-Live: deafness substitutes silence for caller audio (the session clock must keep ticking)', async () => {
     const server = await FakeGptLiveServer.start();
-    const { fake } = await connect(server, { greeting: { mode: 'agent-initiates' } }); // first-turn deafness on by default
+    // Explicit: the default is off on a full-duplex provider (see the next test).
+    const { fake } = await connect(server, {
+      greeting: { mode: 'agent-initiates' },
+      deafness: { ignoreUserAudioUntilFirstTurnDone: true },
+    });
     const tone = mulawToneBase64(20);
     fake.sendMedia(tone);
     fake.sendMedia(tone);
@@ -568,5 +572,39 @@ describe('provider parity: GPT-Live (full-duplex, model-owned turn-taking)', () 
     fake.playAll();
     await waitFor(() => ended.length === 1, 5000, 'call ended after sentence two');
     expect(ended[0]).toBe('agent-hangup');
+  });
+
+  it('GPT-Live: first-turn deafness is off by default — the caller is heard from the first frame (the model owns talk-over)', async () => {
+    const server = await FakeGptLiveServer.start();
+    const { fake } = await connect(server, { greeting: { mode: 'agent-initiates' } });
+    const tone = mulawToneBase64(20);
+    fake.sendMedia(tone);
+    await waitFor(() => server.latest.appendedAudio.length === 1, 2000, 'caller frame');
+    expect(server.latest.appendedAudio[0]).toBe(tone);
+  });
+
+  it('GPT-Live: a session that drops mid-utterance does not wedge playback — finish_call completes via the sentence grace, not the watchdog', async () => {
+    const server = await FakeGptLiveServer.start();
+    const { fake, session } = await connect(server, SESSION, { builtinTools: { finishCall: true } });
+    const ended: string[] = [];
+    session.on('call.ended', (e) => ended.push(e.reason));
+    // The voice is mid-utterance (gate open, audio at Twilio) when the socket dies…
+    server.latest.send({ type: 'session.output_audio.delta', delta: mulawToneBase64(100) });
+    await waitFor(() => fake.sentMediaPayloads.length > 0, 2000, 'agent audio at Twilio');
+    server.latest.drop();
+    // …and the bridge reopens a fresh session. That utterance never ends and its
+    // tail mark never comes: unless it is abandoned, isPlaybackActive() stays true.
+    await waitFor(() => server.connections.length === 2, 3000, 'reconnected');
+    await server.latest.waitForEvent('session.start');
+    server.latest.sendFunctionCall({ name: 'finish_call' });
+    await server.latest.waitForEvent('response.item.create');
+    const mediaBefore = fake.sentMediaPayloads.length;
+    server.latest.sendSpeech({ chunks: [mulawToneBase64(200)], silenceMs: 1000 });
+    await waitFor(() => fake.sentMediaPayloads.length > mediaBefore, 2000, 'goodbye audio');
+    fake.playAll();
+    const t0 = Date.now();
+    await waitFor(() => ended.length === 1, 5000, 'call ended');
+    expect(ended[0]).toBe('agent-hangup');
+    expect(Date.now() - t0).toBeLessThan(4000); // the 7 s watchdog was not what ended it
   });
 });

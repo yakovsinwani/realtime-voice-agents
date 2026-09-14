@@ -148,6 +148,13 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     grace?: NodeJS.Timeout | null;
   } | null = null;
   private pendingTransfer: { phoneNumber: string; callerId?: string } | null = null;
+  /** Model-owned turn-taking: a transfer that landed mid-utterance, held until the sentence plays out. */
+  private pendingHandoff: {
+    target: Agent;
+    reason: string | undefined;
+    grace: NodeJS.Timeout | null;
+    cap: NodeJS.Timeout;
+  } | null = null;
   private endedReason: CallEndReason | null = null;
   private hangupReason: CallEndReason = 'agent-hangup';
 
@@ -651,6 +658,11 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
           this.pendingHangup.grace = null;
         }
       }
+      if (this.pendingHandoff?.grace) {
+        clearTimeout(this.pendingHandoff.grace);
+        this.timers.delete(this.pendingHandoff.grace);
+        this.pendingHandoff.grace = null;
+      }
       this.noteHangupProgress(); // the goodbye began — give it a fresh window
       this.clearIdleTimer();
       this.interruptions.onResponseStarted(responseId);
@@ -683,6 +695,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
         this.flushToolQueue();
         void this.executePendingTransfer();
         this.maybeCompleteHangup();
+        this.maybeRunPendingHandoff();
       }
     });
 
@@ -778,7 +791,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     // barge-in on a turn it never generated.
     const deaf =
       (this.pregreeting !== null && !this.pregreeting.played) ||
-      (this.deps.options.deafness.ignoreUserAudioUntilFirstTurnDone && !this.firstTurnDone) ||
+      (this.firstTurnDeafness() && !this.firstTurnDone) ||
       (this.deps.options.deafness.muteDuringToolExecution && this.runningTools.size > 0) ||
       (this.deps.options.deafness.muteWhileAgentSpeaking && this.tracker.isPlaybackActive()) ||
       this.interruptions.isSuspended;
@@ -908,6 +921,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     this.flushToolQueue();
     void this.executePendingTransfer();
     this.maybeCompleteHangup();
+    this.maybeRunPendingHandoff();
     // A turn the guard swallowed mid-playback gets its answer now. The
     // server-side auto-response skipped it (a response was active at commit
     // time), and `responseStarted` clears the flag if anything answered since.
@@ -1134,6 +1148,10 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
           result: { handoffTo: target.id },
           durationMs: Date.now() - started,
         });
+        if (this.modelOwnsTurnTaking() && (this.generating || this.tracker.isPlaybackActive())) {
+          this.deferHandoff(target, directive.reason);
+          return;
+        }
         await this.performHandoff(target, directive.reason);
         return;
       }
@@ -1493,7 +1511,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
         pending.grace = null;
         if (this.generating || this.tracker.isPlaybackActive()) return; // the next sentence took over
         this.completeHangup();
-      }, HANGUP_SENTENCE_GRACE_MS);
+      }, SENTENCE_GRACE_MS);
       timer.unref?.();
       this.timers.add(timer);
       this.pendingHangup.grace = timer;
@@ -1572,6 +1590,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     if (this.stateValue !== 'active') return;
     const provider = this.provider;
     if (!provider) return;
+    this.abandonOpenPlayback();
     try {
       await provider.connect(this.buildProviderInit());
     } catch (error) {
@@ -1629,6 +1648,89 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
     this.emit('agent.handoff.blocked', { from, to: target, reason, cause: 'no-caller-turn' });
   }
 
+  /**
+   * First-turn deafness shields an agent-first greeting from early caller
+   * speech where the bridge owns barge-in. A full-duplex model owns talk-over
+   * itself, and "deaf" there only means fed silence — so the default flips
+   * off on `turnTaking: 'model'`; an explicit setting is honored as written.
+   */
+  private firstTurnDeafness(): boolean {
+    return this.deps.options.deafness.ignoreUserAudioUntilFirstTurnDone ?? !this.modelOwnsTurnTaking();
+  }
+
+  /**
+   * The provider session behind every open response is being closed (handoff
+   * or reconnect): their tail marks may never come. Finalize them now, or
+   * `isPlaybackActive()` stays true for the rest of the call and everything
+   * gated on it — the hangup grace, REST transfers, guard rotation — wedges
+   * (field, Sept 2026). Whatever Twilio still holds plays out; no
+   * `playback.finished` is claimed for audio nobody confirmed.
+   */
+  private abandonOpenPlayback(): void {
+    if (this.tracker.abandonOpen().length === 0) return;
+    this.interruptions.onPlaybackEnded();
+    this.maybeCompleteHangup();
+    this.maybeRunPendingHandoff();
+  }
+
+  /**
+   * On a full-duplex provider the backend's transfer lands while the voice is
+   * still speaking the sentence that announces it, and the handoff is a
+   * close-and-reopen: performing it at once cuts that sentence, and the
+   * in-flight deltas kill the handoff hold before it starts (field, Sept
+   * 2026). Hold the transfer until the utterance has played out plus one
+   * sentence gap — a new utterance cancels the grace — capped so a voice that
+   * never stops still hands off.
+   */
+  private deferHandoff(target: Agent, reason: string | undefined): void {
+    if (this.pendingHandoff) {
+      this.pendingHandoff.target = target;
+      this.pendingHandoff.reason = reason;
+      return;
+    }
+    const cap = setTimeout(() => {
+      this.timers.delete(cap);
+      const pending = this.pendingHandoff;
+      if (!pending) return;
+      this.log.warn('deferred handoff capped — the voice kept talking; handing off now');
+      this.clearPendingHandoff();
+      void this.performHandoff(pending.target, pending.reason);
+    }, HANDOFF_DEFER_MAX_MS);
+    cap.unref?.();
+    this.timers.add(cap);
+    this.pendingHandoff = { target, reason, grace: null, cap };
+    this.maybeRunPendingHandoff();
+  }
+
+  private maybeRunPendingHandoff(): void {
+    const pending = this.pendingHandoff;
+    if (!pending || pending.grace) return;
+    if (this.generating || this.tracker.isPlaybackActive()) return;
+    const grace = setTimeout(() => {
+      this.timers.delete(grace);
+      const current = this.pendingHandoff;
+      if (!current) return;
+      current.grace = null;
+      if (this.generating || this.tracker.isPlaybackActive()) return; // the next sentence took over
+      this.clearPendingHandoff();
+      void this.performHandoff(current.target, current.reason);
+    }, SENTENCE_GRACE_MS);
+    grace.unref?.();
+    this.timers.add(grace);
+    pending.grace = grace;
+  }
+
+  private clearPendingHandoff(): void {
+    const pending = this.pendingHandoff;
+    if (!pending) return;
+    this.pendingHandoff = null;
+    for (const timer of [pending.grace, pending.cap]) {
+      if (!timer) continue;
+      clearTimeout(timer);
+      this.timers.delete(timer);
+    }
+  }
+
   private async performHandoff(target: Agent, reason?: string): Promise<void> {
     if (this.stateValue !== 'active' || !this.provider) return;
     if (target.id === this.activeAgentValue.id) return;
@@ -1677,6 +1779,7 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
         this.bgAudio.acquire('__handoff__', hold.spec, { ...hold, startDelayMs: hold.startDelayMs ?? 300 });
       }
       try {
+        this.abandonOpenPlayback();
         await this.provider.close();
         await this.provider.connect({ ...this.buildProviderInit(), freshSession: true });
         if (!this.provider.capabilities.startupHistory) this.reinjectHistory(this.provider);
@@ -1917,7 +2020,10 @@ export class CallSession extends TypedEmitter<SessionEventMap> {
 
 const PREGREETING_MARK = 'pre:greeting';
 /** Longer than the speech gate's quiet window plus the mark round trip (0.8 s + ~0.3 s). */
-const HANGUP_SENTENCE_GRACE_MS = 1500;
+/** Model-owned turn-taking: the gate can split one sentence at a pause — wait one gap for the next. */
+const SENTENCE_GRACE_MS = 1500;
+/** A deferred handoff runs no later than this after the transfer landed, even mid-utterance. */
+const HANDOFF_DEFER_MAX_MS = 5000;
 /** 400ms per frame — matches production burst-write implementations. */
 const PREGREETING_CHUNK_BYTES = 3200;
 
