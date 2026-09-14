@@ -32,11 +32,14 @@ export interface GreetingOptions {
 export interface DeafnessOptions {
   /**
    * Drop caller audio until the agent's first turn finishes playing.
-   * Protects the greeting from noisy pickups. Default true — except with
-   * `greeting.mode: 'user-initiates'`, where the caller must be heard to
-   * start the call at all, so the default flips to false. An explicit true
-   * is honored even there, but deafens the call until something else
-   * (an idle nudge, a tool) produces the agent's first turn.
+   * Protects the greeting from noisy pickups on providers where the bridge
+   * owns barge-in. Unset = automatic: true there, false with
+   * `greeting.mode: 'user-initiates'` (the caller must be heard to start the
+   * call at all) and on full-duplex providers (`turnTaking: 'model'`), where
+   * the model owns talk-over and "deaf" only means fed silence. An explicit
+   * value is honored as written — an explicit true with user-initiates
+   * deafens the call until something else (an idle nudge, a tool) produces
+   * the agent's first turn.
    */
   ignoreUserAudioUntilFirstTurnDone?: boolean;
   /** Drop caller audio while a foreground tool is running. Default true. */
@@ -129,7 +132,7 @@ export const DEFAULT_SESSION_OPTIONS: SessionOptions = {
   greeting: { mode: 'agent-initiates' },
   interruptions: { enabled: true },
   deafness: {
-    ignoreUserAudioUntilFirstTurnDone: true,
+    // ignoreUserAudioUntilFirstTurnDone: unset — resolved per provider (see DeafnessOptions)
     muteDuringToolExecution: true,
     muteWhileAgentSpeaking: false,
   },

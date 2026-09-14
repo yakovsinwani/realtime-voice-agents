@@ -205,6 +205,25 @@ export class PlaybackTracker {
   }
 
   /**
+   * The provider session behind every open response is gone (closed for a
+   * handoff or reconnect), so their remaining marks may never come home:
+   * finalize them at their current playedMs so `isPlaybackActive()` cannot
+   * stay true for the rest of the call. Late echoes classify as flushed.
+   * Returns the abandoned responses.
+   */
+  abandonOpen(): Array<{ responseId: string; playedMs: number; itemId?: string }> {
+    const abandoned: Array<{ responseId: string; playedMs: number; itemId?: string }> = [];
+    for (const track of [...this.responses.values()]) {
+      if (track.finished) continue;
+      track.flushed = true;
+      track.finished = true;
+      abandoned.push({ responseId: track.responseId, playedMs: track.playedMs, itemId: track.itemId });
+      this.maybeForget(track);
+    }
+    return abandoned;
+  }
+
+  /**
    * Best-estimate of what the caller has heard of `responseId` right now:
    * last confirmed mark plus wall-clock elapsed since, clamped to the total.
    */

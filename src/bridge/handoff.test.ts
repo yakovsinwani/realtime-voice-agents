@@ -313,6 +313,8 @@ describe('multi-agent handoffs (GPT-Live path: reconnect + history seeded at sta
     server.latest.sendInputTranscript('I need a refund on invoice 12', { startMs: 1000, endMs: 2000 });
     server.latest.sendSpeech({ chunks: [mulawToneBase64(100)], transcript: 'Let me get billing.', startMs: 4000 });
     await waitFor(() => session.transcript.length === 2, 3000, 'transcript');
+    await waitFor(() => fake.sentMediaPayloads.length > 0, 2000, 'agent audio at Twilio');
+    fake.playAll(); // the sentence has played out: a transfer may reopen the session at once
 
     server.latest.sendFunctionCall({ name: 'transfer_to_billing', argumentsJson: '{"reason":"refund request"}' });
     await waitFor(() => session.activeAgent.id === 'billing', 3000, 'handoff');
@@ -333,6 +335,48 @@ describe('multi-agent handoffs (GPT-Live path: reconnect + history seeded at sta
     expect(second.appends).toHaveLength(1);
     expect(second.appends[0]!.type).toBe('session.commentary.append');
     expect(second.appends[0]!.content).toContain('You are now Billing Department');
+
+    await bridge.close();
+    await server.close();
+  });
+
+  it('holds a transfer that lands mid-utterance until the sentence has played out, and the handoff hold covers the reopen', async () => {
+    const server = await FakeGptLiveServer.start();
+    const { receptionist } = makeAgents();
+    const bridge = new TwilioRealtimeBridge({
+      agent: receptionist,
+      provider: gptLive({ apiKey: 'k', baseUrl: server.url }),
+      session: { greeting: { mode: 'user-initiates' }, handoffHold: { spec: 'ringing', startDelayMs: 0 } },
+    });
+    const fake = new FakeTwilioMediaStream();
+    bridge.handleConnection(fake);
+    fake.connect();
+    await waitFor(() => bridge.getSession(fake.callSid)?.state === 'active', 2000, 'active');
+    const session = bridge.getSession(fake.callSid)!;
+    const holds: string[] = [];
+    const utterancesEnded: string[] = [];
+    session.on('background_audio.started', (e) => holds.push(e.preset ?? ''));
+    session.on('agent.speech.ended', (e) => utterancesEnded.push(e.responseId));
+
+    // The voice is mid-sentence ("one moment, transferring you…") when the
+    // backend's transfer lands: the tool call settles, the session does not.
+    server.latest.send({ type: 'session.output_audio.delta', delta: mulawToneBase64(300) });
+    await waitFor(() => fake.sentMediaPayloads.length > 0, 2000, 'agent audio at Twilio');
+    server.latest.sendFunctionCall({ name: 'transfer_to_billing' });
+    await server.latest.waitForEvent('response.item.create');
+    await delay(300);
+    expect(server.connections).toHaveLength(1);
+    expect(session.activeAgent.id).toBe('receptionist');
+    expect(holds).toEqual([]);
+
+    // The sentence ends and plays out; one sentence gap later the handoff reopens.
+    server.latest.sendSilence(1000);
+    await waitFor(() => utterancesEnded.length === 1, 2000, 'utterance end');
+    fake.playAll();
+    await waitFor(() => server.connections.length === 2, 4000, 'reopened');
+    await waitFor(() => session.activeAgent.id === 'billing', 2000, 'handoff');
+    // Nothing was in flight when the hold started, so it survived to cover the gap.
+    expect(holds).toEqual(['ringing']);
 
     await bridge.close();
     await server.close();

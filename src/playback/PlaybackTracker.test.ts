@@ -130,4 +130,21 @@ describe('PlaybackTracker', () => {
     expect(t.onMarkEcho('tra:999')).toBeNull();
     expect(t.onMarkEcho('bg:1')).toBeNull();
   });
+
+  it('abandonOpen finalizes responses whose session is gone, so a lost tail mark cannot keep playback active', () => {
+    const t = new PlaybackTracker(() => 0, { checkpointIntervalMs: 200 });
+    const m1 = t.onAudioSent('cut', 100)!;
+    t.onAudioSent('cut', 150); // generation never completes: the session closed under it
+    const m2 = t.onAudioSent('done', 100)!;
+    t.onGenerationDone('done');
+    t.onMarkEcho(m2); // already finished honestly — not touched
+    expect(t.isPlaybackActive()).toBe(true);
+
+    const abandoned = t.abandonOpen();
+    expect(abandoned).toEqual([{ responseId: 'cut', playedMs: 0, itemId: undefined }]);
+    expect(t.isPlaybackActive()).toBe(false);
+    // A late echo for the abandoned response is flushed, not played.
+    expect(t.onMarkEcho(m1)).toMatchObject({ kind: 'flushed', responseId: 'cut', playbackFinished: false });
+    expect(t.abandonOpen()).toEqual([]); // idempotent
+  });
 });

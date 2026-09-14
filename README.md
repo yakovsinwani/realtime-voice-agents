@@ -119,7 +119,8 @@ One `SessionOptions` surface configures all four; where a provider can't honor a
 - **Tools never pause the voice.** Results are delivered the moment they are ready regardless of `toolResultDelivery`; an interruption does not cancel a running tool, and its result still reaches the backend. Results are relayed in the model's own words — use exact wording only through the voice prompt.
 - **Greetings, nudges and goodbyes** (`greeting.instructions`, `idle.prompts`, `finish_call`) are delivered as `session.commentary.append` — the append that reliably produces speech on demand. Keypad entries and deferred results are `session.thinking.append`; runtime instructions are `session.instructions.append`. Each append is capped at 500 tokens (long texts are split).
 - **Immutable session.** Instructions, voice and audio format cannot change after start, so handoffs and reconnects open a fresh session and seed the attributed transcript through `session.input` (≤ 128 messages) — the anti-loop replay is preserved. Sessions expire after 120 minutes; an expiry reconnects the same way.
-- **Deafness feeds silence.** The model's session clock runs on input audio, so `deafness` options replace caller audio with silence instead of dropping frames.
+- **Transfers wait for the sentence.** A handoff here is a close-and-reopen, and the backend's transfer lands while the voice is still announcing it — the bridge holds the handoff until that utterance has played out (plus one sentence gap, capped at 5 s), so nothing is cut mid-word and `session.handoffHold` audio covers the reopen. Prompt the voice to *delegate first, announce after*: a transfer or tool the voice announces without delegating never happens.
+- **Deafness feeds silence.** The model's session clock runs on input audio, so `deafness` options replace caller audio with silence instead of dropping frames. `ignoreUserAudioUntilFirstTurnDone` therefore defaults to **off** here — the model handles talk-over itself; set it explicitly to keep the greeting deaf.
 - **Billing is per second** of session (plus backend tokens). `session.usage.audioSeconds` carries the running total; backend token usage is summed from `response.completed`. The provider sends `session.close` on teardown and waits for `session.closed`, so a hung-up call never keeps billing.
 
 ## Provider fallbacks
@@ -341,7 +342,7 @@ session: {
   greeting: { mode: 'agent-initiates' },        // 'user-initiates' to wait
   interruptions: { enabled: true },
   deafness: {
-    ignoreUserAudioUntilFirstTurnDone: true,    // auto-false with greeting.mode 'user-initiates' (caller must be heard to start)
+    ignoreUserAudioUntilFirstTurnDone: undefined, // auto: true, except false with greeting.mode 'user-initiates' and on full-duplex providers (GPT-Live)
     muteDuringToolExecution: true,
     muteWhileAgentSpeaking: false,              // half-duplex: deaf while agent audio plays (caller speech is lost, not queued)
   },
@@ -355,6 +356,7 @@ session: {
   toolResultDelivery: 'afterPlayback',          // or 'immediate'
   toolBackgroundAudio: undefined,               // default hold audio for tools
   handoffVoicePolicy: 'keep',                   // or 'reconnect' to switch voices
+  handoffHold: undefined,                       // { spec: 'ringing', ... }: hold audio over a reconnect-style handoff (Gemini, GPT-Live)
   context: {},                                  // seed session KV for tools/instructions
 }
 ```
