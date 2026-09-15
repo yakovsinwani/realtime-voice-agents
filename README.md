@@ -75,7 +75,110 @@ app.register(async (i) => {
 await app.listen({ port: 3000 });
 ```
 
-Point your Twilio number's Voice webhook at `POST /twilio/voice`. That's a working agent. See [examples/fastify](examples/fastify) for the full tour (handoffs, strategies, approvals, outbound calls) and [examples/express-ws](examples/express-ws) for the minimal version.
+Point your Twilio number's Voice webhook at `POST /twilio/voice`. That's a working agent. See [examples/fastify](examples/fastify) for the full tour (handoffs, strategies, approvals, outbound calls) and [examples/express-ws](examples/express-ws) for the minimal version. Running on **GPT-Live**? Read [Using GPT-Live](#using-gpt-live-full-duplex) next — the prompting is different.
+
+## Using GPT-Live (full-duplex)
+
+[GPT-Live](https://developers.openai.com/api/docs/guides/live) is OpenAI's full-duplex voice API: the voice model listens while it speaks and owns turn-taking, and a separate **backend** Responses model does the reasoning and runs your tools while the conversation keeps going. Same `Agent` / `tool()` / bridge as above — the difference is how you prompt it. This is the pattern we run in production:
+
+```ts
+import { Agent, TwilioRealtimeBridge, tool } from 'realtime-voice-agents';
+import { gptLive } from 'realtime-voice-agents/gpt-live';
+
+const saveMessage = tool({
+  name: 'save_service_message',
+  description: 'Save a service message after the caller confirmed name, callback phone and subject.',
+  parameters: z.object({ customerName: z.string(), phone: z.string(), subject: z.string() }),
+  backgroundAudio: false, // the voice keeps the caller company while this runs — no hold loop needed
+  execute: async (args) => ({ success: true, ...args }),
+});
+
+// 1. The VOICE prompt lives on the Agent: style + three policies. Nothing about procedures.
+const voiceInstructions = `
+You are Dana, a voice agent at Acme's service desk. Speak naturally, calm pace, short sentences.
+Goal: take a message — name, callback phone, subject. Read the phone number back and ask for confirmation.
+
+Backchannel policy: minimal. No "uh-huh" while the caller is talking; acknowledge briefly after they finish.
+Interruption policy: if the caller talks over you, stop at once and listen. Finish the opening sentence first.
+
+Delegation policy:
+Backend tools: save_service_message (stores the message); finish_call (hangs up).
+Delegate to the backend when: the caller confirmed every detail; or the caller says goodbye — delegate finish_call on the first "bye", then say a short goodbye.
+Do not delegate when: details are still missing or unconfirmed; the caller only greets or asks you to repeat.
+While the backend works, tell the caller you are saving the message and keep listening. Never guess the
+result — only after the backend confirms, say the message was saved.
+`.trim();
+
+// 2. The BACKEND prompt lives on the provider: procedures and tool rules. Short, one-sentence replies.
+const backendInstructions = `
+You are the backend for a service-message desk. The voice agent delegates to you only once the caller
+has confirmed all details. Call save_service_message exactly once per confirmed message, with the details
+as stated. When the caller says goodbye, call finish_call. Reply in one short sentence the voice agent can
+relay. Do not ask the caller new questions.
+`.trim();
+
+const bridge = new TwilioRealtimeBridge({
+  agent: new Agent({ name: 'Dana', instructions: voiceInstructions, tools: [saveMessage] }),
+  provider: gptLive({
+    voice: 'marin',
+    delegation: { model: 'gpt-5.6-terra', instructions: backendInstructions },
+  }),
+  session: {
+    // Delivered as session.commentary.append — the model speaks the quoted line verbatim.
+    greeting: {
+      mode: 'agent-initiates',
+      instructions: 'Open the call with exactly: "Hi, you have reached Acme. What is your name, please?"',
+    },
+  },
+  builtinTools: { finishCall: true },
+  twilio: { accountSid, authToken },
+});
+```
+
+What to know before your first call:
+
+- **Two prompts, two jobs.** The voice prompt is *how to talk* (style, backchannel, interruption, when to delegate). The backend prompt is *what to do* (procedures, tool rules, reply format). Putting procedures in the voice prompt makes the voice narrate tools it cannot call; putting style in the backend prompt does nothing.
+- **Delegate first, announce after.** The voice model cannot call tools — only the backend can. A voice that says "I'm transferring you" or "saving that now" without delegating leaves the caller waiting for nothing. Every voice prompt we ship carries the line: *never promise a transfer or a result in words without delegating first.*
+- **Tools don't pause the voice.** Results reach the backend the moment they are ready (`toolResultDelivery` is ignored), and the voice relays them in its own words. Set `backgroundAudio: false` on tools — hold music over a voice that is still talking sounds broken.
+- **Barge-in belongs to the model.** `interruptions`, `vad`, `noiseAdaptiveVad` and `session.interrupt()` are no-ops here, and `user.speech.*` never fires. Protect the greeting through the prompt ("finish the opening sentence first"), not through guards. First-turn deafness defaults to off.
+- **Goodbyes work as usual.** `finish_call` is delivered as a commentary append, marks confirm the farewell played out, then the leg completes via REST.
+
+### Multi-agent with GPT-Live: a voice per agent
+
+Sessions are immutable (instructions, voice), so every handoff is a close-and-reopen with the attributed transcript seeded into the new session. That gives each agent its own voice for free — and a real gap to cover:
+
+```ts
+const billing = new Agent({
+  name: 'Michal', id: 'billing', voice: 'coral',
+  instructions: billingVoicePrompt,   // "You were transferred this caller — acknowledge, don't re-greet."
+  handoffDescription: 'Transfer for balance, charges, invoices and payments.',
+  tools: [checkBalance],
+  providerOptions: { delegation: { responses: { instructions: billingBackendPrompt } } }, // per-agent backend prompt
+});
+const support = new Agent({ name: 'Ido', id: 'support', voice: 'cedar', /* … */ handoffs: [billing] });
+billing.handoffs.push(support); // specialists can hand back and forth
+
+const bridge = new TwilioRealtimeBridge({
+  agent: new Agent({
+    name: 'Rotem', id: 'reception', voice: 'marin',
+    instructions: receptionVoicePrompt, // "Only find out billing vs. support, then delegate — the backend transfers."
+    handoffs: [billing, support],
+  }),
+  provider: gptLive({
+    voice: 'marin',
+    delegation: { model: 'gpt-5.6-terra', instructions: 'Call exactly one transfer_to_* tool per delegation.' },
+  }),
+  session: { handoffHold: { spec: 'elevator-jazz' } }, // covers the reopen
+  builtinTools: { finishCall: true },
+});
+```
+
+- **The transfer is a backend tool.** Each specialist's voice prompt says so explicitly: *"the transfer is done by the backend (transfer_to_support) — you cannot transfer yourself; delegate first, then say 'transferring you'."*
+- **The bridge waits for the sentence.** The backend's transfer lands while the voice is still announcing it; the handoff is held until that utterance has played (plus one sentence gap, capped at 8 s), so nothing is cut mid-word, and `handoffHold` audio covers the reopen.
+- **Loops are structurally impossible.** An agent that just took over cannot transfer again until the caller speaks (see [handoffs](#multi-agent-handoffs-swarm)).
+- **Tell incoming agents they were transferred.** Their voice prompt opens with "the caller was transferred to you — acknowledge briefly, do not greet again as if this were a new call"; the seeded transcript gives them the context.
+
+Useful events for a test call: `agent.speech.started` / `agent.speech.ended` (utterance boundaries synthesized from the stream), `playback.started` / `playback.finished`, `transcript.user` / `transcript.agent`, `agent.handoff` / `agent.handoff.blocked`, `tool.started` / `tool.completed`, and `usage.updated` (`audioSeconds` — billing is per second of session — plus backend tokens). The full list of GPT-Live specifics is in [GPT-Live: full-duplex, two prompts](#gpt-live-full-duplex-two-prompts).
 
 ## Providers
 
