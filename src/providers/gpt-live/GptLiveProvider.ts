@@ -15,8 +15,9 @@
  *   silence between utterances is not forwarded.
  * - **The backend does the thinking.** Tools are declared on a Responses
  *   model (`delegation.responses`), calls arrive wrapped in `response.event`
- *   envelopes, results go back as `response.item.create` + one
- *   `response.create`. The voice keeps talking meanwhile
+ *   envelopes, results go back as `response.item.create` each, then one
+ *   `response.create` per batch — once every call is answered and the
+ *   response that issued them has finished. The voice keeps talking meanwhile
  *   (`capabilities.decoupledBackend`).
  * - **Text reaches the model only through appends** (≤ 500 tokens each):
  *   instructions (policy), thinking (quiet context), commentary (say this).
@@ -161,6 +162,14 @@ export class GptLiveProvider extends BaseRealtimeProvider {
   private readonly outputTranscript: TranscriptGrouper;
   private readonly acks = new Map<string, AckWaiter>();
   private readonly seenCalls = new Set<string>();
+  /** Backend calls with no output yet: the server refuses a continuation until every one is answered. */
+  private readonly openCalls = new Set<string>();
+  /** A backend response is in progress — a delegation's, or one of our continuations. */
+  private backendRunning = false;
+  /** `event_id` of our last continuation: its refusal means no run started. */
+  private backendRunEventId: string | null = null;
+  /** A continuation is wanted: sent once no call is open and no backend response is running. */
+  private backendRunWaiting = false;
   private sessionClosed: { reason?: string; usageSeconds?: number } | null = null;
   private closeListeners: Array<() => void> = [];
 
@@ -196,6 +205,10 @@ export class GptLiveProvider extends BaseRealtimeProvider {
     this.sessionClosed = null;
     this.sessionId = null;
     this.expiresAt = null;
+    this.openCalls.clear();
+    this.backendRunning = false;
+    this.backendRunEventId = null;
+    this.backendRunWaiting = false;
     this.resetUtteranceState();
     if (init.vad !== undefined || init.transcription !== undefined || init.temperature !== undefined) {
       this.logger.debug('gpt-live: vad/transcription/temperature are model-owned and ignored');
@@ -376,12 +389,29 @@ export class GptLiveProvider extends BaseRealtimeProvider {
         output: typeof output === 'string' ? output : JSON.stringify(output ?? null),
       },
     });
-    // The backend does not continue on its own after a result; one create
-    // covers every result submitted before it (the engine sends the flag on
-    // the last of a batch).
+    this.openCalls.delete(callId);
+    // The backend does not continue on its own after a result, and it refuses
+    // a continuation while any call of its batch is unanswered
+    // (function_call_outputs_required — nine refusals for one ten-call batch,
+    // field, Oct 2026). On a decoupled backend the engine flags every result
+    // as it lands, so the run waits for the last one, and for the response
+    // that issued the calls to finish: only then is the batch known.
     if (options.triggerResponse !== false) {
-      this.send({ type: 'response.create', event_id: nextEventId('continue') });
+      this.backendRunWaiting = true;
+      this.runWaitingBackend();
     }
+  }
+
+  /** One `response.create` covers every output queued before it. */
+  private runBackend(): void {
+    this.backendRunWaiting = false;
+    this.backendRunning = true;
+    this.backendRunEventId = nextEventId('continue');
+    this.send({ type: 'response.create', event_id: this.backendRunEventId });
+  }
+
+  private runWaitingBackend(): void {
+    if (this.backendRunWaiting && !this.backendRunning && this.openCalls.size === 0) this.runBackend();
   }
 
   /**
@@ -448,6 +478,7 @@ export class GptLiveProvider extends BaseRealtimeProvider {
         }
         break;
       case 'session.delegation.created':
+        this.backendRunning = true;
         this.logger.debug('gpt-live delegation created', {
           id: event.delegation?.id,
           target: event.delegation?.target,
@@ -482,7 +513,11 @@ export class GptLiveProvider extends BaseRealtimeProvider {
         break;
       }
       case 'error': {
-        if (event.error?.client_event_id) this.resolveAck(event.error.client_event_id, false);
+        const clientEventId = event.error?.client_event_id;
+        if (clientEventId) {
+          this.resolveAck(clientEventId, false);
+          if (clientEventId === this.backendRunEventId) this.backendRunning = false;
+        }
         this.logger.warn('provider error event', { error: event.error });
         this.emit('error', new Error(`${this.name} error: ${JSON.stringify(event.error ?? event)}`));
         break;
@@ -582,6 +617,8 @@ export class GptLiveProvider extends BaseRealtimeProvider {
       if (this.seenCalls.has(callId)) return;
       this.seenCalls.add(callId);
       if (this.seenCalls.size > 1000) this.seenCalls.delete(this.seenCalls.values().next().value!);
+      // Open before the emit: the engine may answer synchronously inside it (unknown tool).
+      this.openCalls.add(callId);
       this.emit('toolCall', {
         id: callId,
         name: item.name,
@@ -594,10 +631,14 @@ export class GptLiveProvider extends BaseRealtimeProvider {
     if (type === 'response.completed' || type === 'response.done') {
       const usage = normalizeUsage(inner.response?.usage);
       if (usage) this.emit('usage', usage);
+      this.backendRunning = false;
+      this.runWaitingBackend();
       return;
     }
     if (type === 'response.failed' || type === 'response.incomplete') {
       this.logger.warn('gpt-live backend response did not complete', { type, delegationId, error: inner.response?.error });
+      this.backendRunning = false;
+      this.runWaitingBackend();
     }
   }
 

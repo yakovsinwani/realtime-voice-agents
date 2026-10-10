@@ -10,6 +10,12 @@
  * closes on quiet AUDIO, so tests never wait on wall-clock), timed transcript
  * fragments, backend function calls wrapped in `response.event` envelopes,
  * and usage ticks. Every client frame is recorded for assertions.
+ *
+ * Like the real server, it refuses a `response.create` while a function call
+ * it issued has no `function_call_output` (`function_call_outputs_required`,
+ * naming the unanswered calls — field, Oct 2026), and
+ * `sendParallelFunctionCalls` issues several calls from one backend response,
+ * as `parallel_tool_calls` does.
  */
 
 import type { IncomingHttpHeaders } from 'node:http';
@@ -71,6 +77,8 @@ export class FakeGptLiveConnection {
   session: Record<string, any> | null = null;
   /** Running session-timeline position for scripted speech / transcripts. */
   timelineMs = 0;
+  /** Calls this connection issued that have no `function_call_output` yet, in issue order. */
+  readonly unansweredCalls: string[] = [];
   private readonly server: FakeGptLiveServer;
 
   constructor(server: FakeGptLiveServer, socket: WebSocket, upgradeHeaders: IncomingHttpHeaders = {}) {
@@ -159,23 +167,29 @@ export class FakeGptLiveConnection {
   sendFunctionCall(options: { name: string; argumentsJson?: string; callId?: string; delegationId?: string }): string {
     const callId = options.callId ?? `call_${++callCounter}`;
     const delegationId = options.delegationId ?? `item_${callCounter}`;
-    this.send({
-      type: 'session.delegation.created',
-      event_id: `evt_${Date.now()}`,
-      offset_ms: this.timelineMs,
-      delegation: { id: delegationId, type: 'delegation', target: 'responses', response_id: `resp_${callCounter}` },
-    });
-    this.send({
-      type: 'response.event',
-      event_id: `evt_${Date.now()}`,
-      delegation_id: delegationId,
-      event: {
-        type: 'response.output_item.done',
-        output_index: 0,
-        item: { type: 'function_call', id: `fc_${callCounter}`, call_id: callId, name: options.name, arguments: options.argumentsJson ?? '{}', status: 'completed' },
-      },
-    });
+    this.sendDelegationCreated(delegationId, `resp_${callCounter}`);
+    this.sendFunctionCallItem({ ...options, callId, delegationId, itemId: `fc_${callCounter}`, outputIndex: 0 });
     return callId;
+  }
+
+  /**
+   * One backend response issuing several calls at once (`parallel_tool_calls`):
+   * one delegation, then each call in its own envelope. The response's
+   * completion is the test's to send (`sendBackendCompleted`) — on the real
+   * wire it follows the last call.
+   */
+  sendParallelFunctionCalls(
+    calls: Array<{ name: string; argumentsJson?: string; callId?: string }>,
+    options: { delegationId?: string } = {},
+  ): string[] {
+    const responseNumber = ++callCounter;
+    const delegationId = options.delegationId ?? `item_${responseNumber}`;
+    this.sendDelegationCreated(delegationId, `resp_${responseNumber}`);
+    return calls.map((call, outputIndex) => {
+      const callId = call.callId ?? `call_${++callCounter}`;
+      this.sendFunctionCallItem({ ...call, callId, delegationId, itemId: `fc_${callCounter}`, outputIndex });
+      return callId;
+    });
   }
 
   /** The backend finished a response (carries token usage). */
@@ -215,6 +229,36 @@ export class FakeGptLiveConnection {
     this.socket.close(code, reason);
   }
 
+  private sendDelegationCreated(delegationId: string, responseId: string): void {
+    this.send({
+      type: 'session.delegation.created',
+      event_id: `evt_${Date.now()}`,
+      offset_ms: this.timelineMs,
+      delegation: { id: delegationId, type: 'delegation', target: 'responses', response_id: responseId },
+    });
+  }
+
+  private sendFunctionCallItem(call: {
+    name: string;
+    argumentsJson?: string;
+    callId: string;
+    delegationId: string;
+    itemId: string;
+    outputIndex: number;
+  }): void {
+    if (!this.unansweredCalls.includes(call.callId)) this.unansweredCalls.push(call.callId);
+    this.send({
+      type: 'response.event',
+      event_id: `evt_${Date.now()}`,
+      delegation_id: call.delegationId,
+      event: {
+        type: 'response.output_item.done',
+        output_index: call.outputIndex,
+        item: { type: 'function_call', id: call.itemId, call_id: call.callId, name: call.name, arguments: call.argumentsJson ?? '{}', status: 'completed' },
+      },
+    });
+  }
+
   private sendFragments(type: string, text: string, range: { startMs?: number; endMs?: number }): void {
     const words = text.split(/(\s+)/).filter((w) => w.length > 0);
     const startMs = range.startMs ?? this.timelineMs;
@@ -248,6 +292,25 @@ export class FakeGptLiveConnection {
     if (frame.type === 'session.close') {
       this.send({ type: 'session.closed', event_id: `evt_${Date.now()}`, client_event_id: frame.event_id, reason: 'close_requested', usage: { seconds: Math.round(this.timelineMs / 1000) }, session: this.session });
       this.socket.close(1000, 'close_requested');
+      return;
+    }
+    if (frame.type === 'response.item.create') {
+      if (frame.item?.type === 'function_call_output') {
+        const index = this.unansweredCalls.indexOf(frame.item.call_id);
+        if (index >= 0) this.unansweredCalls.splice(index, 1);
+      }
+      return;
+    }
+    if (frame.type === 'response.create') {
+      if (this.unansweredCalls.length > 0) {
+        this.sendError({
+          type: 'invalid_request_error',
+          code: 'function_call_outputs_required',
+          message: `Missing tool results or approvals for: ${this.unansweredCalls.join(', ')}.`,
+          param: 'type',
+          client_event_id: frame.event_id,
+        });
+      }
       return;
     }
     if (options.autoAck === false) return;

@@ -67,8 +67,11 @@ export interface ProviderCapabilities {
    * Tool results feed a backend that runs independently of speech (the voice
    * model keeps talking while it works), so holding them until playback
    * finishes only adds latency: the engine delivers results and deferred
-   * injections immediately, regardless of `toolResultDelivery`. Usage is
-   * accounted from the provider's `usage` events (no response carries it).
+   * injections immediately, regardless of `toolResultDelivery`. Each result
+   * goes out with `triggerResponse` set, as it lands — a provider whose
+   * backend refuses to continue mid-batch holds the continuation until the
+   * batch is answered (GPT-Live does). Usage is accounted from the
+   * provider's `usage` events (no response carries it).
    */
   decoupledBackend?: boolean;
 }

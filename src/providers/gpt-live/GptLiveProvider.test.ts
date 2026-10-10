@@ -187,6 +187,7 @@ describe('GptLiveProvider', () => {
     server.latest.sendFunctionCall({ name: 'lookup', argumentsJson: '{"q":"a"}', callId });
     await delay(30);
     expect(calls).toHaveLength(1);
+    server.latest.sendBackendCompleted({ delegationId: 'item_9' }); // the response that issued the call ends, as on the wire
 
     provider.sendToolResult(callId, { ok: true }, { triggerResponse: false });
     provider.sendToolResult('call_other', 'raw string', { triggerResponse: true });
@@ -195,6 +196,161 @@ describe('GptLiveProvider', () => {
     expect(items[0]!.item).toEqual({ type: 'function_call_output', call_id: callId, output: '{"ok":true}' });
     expect(items[1]!.item).toEqual({ type: 'function_call_output', call_id: 'call_other', output: 'raw string' });
     expect(server.latest.eventsOfType('response.create')).toHaveLength(1);
+  });
+
+  /** What reached the backend, in order: `output:<call_id>` per result, `create` per continuation. */
+  const backendFrames = (): string[] =>
+    server.latest.received
+      .filter((f) => f.type === 'response.item.create' || f.type === 'response.create')
+      .map((f) => (f.type === 'response.create' ? 'create' : `output:${f.item.call_id}`));
+
+  /** One backend response issuing `count` calls at once; resolves with their ids once the provider surfaced them. */
+  const issueBatch = async (count: number): Promise<string[]> => {
+    const surfaced: string[] = [];
+    const onCall = (call: { id: string }) => {
+      surfaced.push(call.id);
+    };
+    provider.on('toolCall', onCall);
+    const callIds = server.latest.sendParallelFunctionCalls(
+      Array.from({ length: count }, (_, i) => ({ name: 'search_products', argumentsJson: `{"q":"item ${i}"}` })),
+    );
+    await waitFor(() => surfaced.length === count, 1000, 'the batch');
+    provider.off('toolCall', onCall);
+    expect(surfaced).toEqual(callIds);
+    return callIds;
+  };
+
+  /** The backend response in progress finishes; resolves once the provider has processed it. */
+  const completeResponse = async (): Promise<void> => {
+    let processed = false;
+    provider.once('usage', () => {
+      processed = true;
+    });
+    server.latest.sendBackendCompleted();
+    await waitFor(() => processed, 1000, 'the response completion');
+  };
+
+  // Field (Oct 2026): ten parallel webhooks drew nine function_call_outputs_required
+  // refusals — the backend refuses a continuation while any call of its batch is unanswered.
+  describe.each([
+    ['0-1-2', [0, 1, 2]],
+    ['0-2-1', [0, 2, 1]],
+    ['1-0-2', [1, 0, 2]],
+    ['1-2-0', [1, 2, 0]],
+    ['2-0-1', [2, 0, 1]],
+    ['2-1-0', [2, 1, 0]],
+  ])('a three-call batch answered in the order %s', (_label, order) => {
+    it.each([0, 1, 2, 3])(
+      'continues the backend once, after the last output (the response completed after %i results)',
+      async (completedAfter) => {
+        provider = makeProvider();
+        await provider.connect({ instructions: 'x' });
+        const errors: Error[] = [];
+        provider.on('error', (error) => errors.push(error));
+        const callIds = await issueBatch(3);
+        for (const [answered, index] of order.entries()) {
+          if (answered === completedAfter) await completeResponse();
+          provider.sendToolResult(callIds[index]!, { found: index });
+        }
+        if (completedAfter === order.length) {
+          // Every call is answered, but the response that issued them is still running.
+          await waitFor(() => backendFrames().length === order.length, 1000, 'the outputs');
+          await delay(30);
+          expect(backendFrames()).not.toContain('create');
+          await completeResponse();
+        }
+        await server.latest.waitForEvent('response.create');
+        await delay(30);
+        expect(backendFrames()).toEqual([...order.map((index) => `output:${callIds[index]}`), 'create']);
+        expect(errors).toEqual([]);
+      },
+    );
+  });
+
+  it('a lone call answered after its response completed is continued at once', async () => {
+    provider = makeProvider();
+    await provider.connect({ instructions: 'x' });
+    const [callId] = await issueBatch(1);
+    await completeResponse();
+    provider.sendToolResult(callId!, { ok: true });
+    await server.latest.waitForEvent('response.create');
+    expect(backendFrames()).toEqual([`output:${callId}`, 'create']);
+  });
+
+  it('a result that arrives before its response completes waits for the completion', async () => {
+    provider = makeProvider();
+    await provider.connect({ instructions: 'x' });
+    // Until the response that issued the call finishes, more calls of its batch may be on the way.
+    const [callId] = await issueBatch(1);
+    provider.sendToolResult(callId!, { ok: true });
+    await server.latest.waitForEvent('response.item.create');
+    await delay(30);
+    expect(backendFrames()).toEqual([`output:${callId}`]);
+    await completeResponse();
+    await server.latest.waitForEvent('response.create');
+    await delay(30);
+    expect(backendFrames()).toEqual([`output:${callId}`, 'create']);
+  });
+
+  it('a result sent without triggerResponse (a handoff) never continues the backend', async () => {
+    provider = makeProvider();
+    await provider.connect({ instructions: 'x' });
+    const [callId] = await issueBatch(1);
+    await completeResponse();
+    provider.sendToolResult(callId!, { status: 'transferring_conversation' }, { triggerResponse: false });
+    await server.latest.waitForEvent('response.item.create');
+    await delay(30);
+    expect(backendFrames()).toEqual([`output:${callId}`]);
+  });
+
+  it('a continuation is a running response too: a call it issues is continued after it completes', async () => {
+    provider = makeProvider();
+    await provider.connect({ instructions: 'x' });
+    const [first] = await issueBatch(1);
+    await completeResponse();
+    provider.sendToolResult(first!, { ok: true });
+    await server.latest.waitForEvent('response.create');
+    // The continuation calls one more tool, and the tool answers before that response completes.
+    const calls: string[] = [];
+    provider.on('toolCall', (call) => calls.push(call.id));
+    server.latest.send({
+      type: 'response.event',
+      delegation_id: null,
+      event: {
+        type: 'response.output_item.done',
+        output_index: 0,
+        item: { type: 'function_call', id: 'fc_next', call_id: 'call_next', name: 'book', arguments: '{}', status: 'completed' },
+      },
+    });
+    await waitFor(() => calls.length === 1, 1000, 'the follow-up call');
+    provider.sendToolResult('call_next', { ok: true });
+    await server.latest.waitForEvent((f) => f.type === 'response.item.create' && f.item.call_id === 'call_next');
+    await delay(30);
+    expect(backendFrames()).toEqual([`output:${first}`, 'create', 'output:call_next']);
+    await completeResponse();
+    await waitFor(() => backendFrames().length === 4, 1000, 'the second continuation');
+    expect(backendFrames()).toEqual([`output:${first}`, 'create', 'output:call_next', 'create']);
+  });
+
+  it('a refused continuation does not leave the backend marked running', async () => {
+    provider = makeProvider();
+    await provider.connect({ instructions: 'x' });
+    const errors: Error[] = [];
+    provider.on('error', (error) => errors.push(error));
+    const [callId] = await issueBatch(1);
+    await completeResponse();
+    // The server holds a call the provider never saw, so it refuses the continuation.
+    server.latest.unansweredCalls.push('call_unseen');
+    provider.sendToolResult(callId!, { ok: true });
+    await waitFor(() => errors.length === 1, 1000, 'the refusal');
+    expect(errors[0]!.message).toMatch(/function_call_outputs_required/);
+    expect(errors[0]!.message).toContain('Missing tool results or approvals for: call_unseen.');
+    // No run started, so none will finish: the next result is continued at once.
+    provider.sendToolResult('call_unseen', { ok: true });
+    await waitFor(() => backendFrames().length === 4, 1000, 'the second continuation');
+    await delay(30);
+    expect(backendFrames()).toEqual([`output:${callId}`, 'create', 'output:call_unseen', 'create']);
+    expect(errors).toHaveLength(1);
   });
 
   it('maps createResponse and sendText onto the three appends', async () => {

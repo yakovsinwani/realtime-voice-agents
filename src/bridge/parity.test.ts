@@ -465,11 +465,48 @@ describe('provider parity: GPT-Live (full-duplex, model-owned turn-taking)', () 
     server.latest.send({ type: 'session.output_audio.delta', delta: mulawToneBase64(100) });
     await waitFor(() => fake.sentMediaPayloads.length > 0, 2000, 'agent audio at Twilio');
     server.latest.sendFunctionCall({ name: 'shared_tool', argumentsJson: '{"q":"x"}' });
+    server.latest.sendBackendCompleted(); // the response that issued the call ends, as on the wire
     const item = await server.latest.waitForEvent('response.item.create');
     expect(JSON.parse(item.item.output)).toEqual({ ok: true });
     await server.latest.waitForEvent('response.create');
     // …and nothing had finished playing: the default afterPlayback queue was bypassed.
     expect(finished).toEqual([]);
+  });
+
+  it('GPT-Live: a parallel batch reaches the backend as one continuation, after its slowest result', async () => {
+    // Field (Oct 2026): ten parallel lookups, and every result but the last drew a
+    // function_call_outputs_required refusal. Each result goes out as it finishes;
+    // the backend is continued once, after the last.
+    const server = await FakeGptLiveServer.start();
+    const delays: Record<string, number> = { slow: 80, fast: 0, middle: 40 };
+    const agent = new Agent({
+      name: 'Batch Agent',
+      instructions: 'Shared instructions.',
+      tools: [
+        tool({
+          name: 'search_products',
+          description: 'Search the catalog.',
+          parameters: z.object({ q: z.string() }),
+          execute: async ({ q }) => {
+            await delay(delays[q]!);
+            return { q };
+          },
+        }),
+      ],
+    });
+    const { session } = await connect(server, SESSION, { agent });
+    const errors: Error[] = [];
+    session.on('error', (error) => errors.push(error));
+    server.latest.sendParallelFunctionCalls(
+      Object.keys(delays).map((q) => ({ name: 'search_products', argumentsJson: JSON.stringify({ q }) })),
+    );
+    server.latest.sendBackendCompleted();
+    await server.latest.waitForEvent('response.create');
+    await delay(50);
+    const backend = server.latest.received.filter((f) => f.type === 'response.item.create' || f.type === 'response.create');
+    expect(backend.slice(0, -1).map((f) => JSON.parse(f.item.output).q)).toEqual(['fast', 'middle', 'slow']);
+    expect(backend.at(-1)!.type).toBe('response.create');
+    expect(errors).toEqual([]);
   });
 
   it('GPT-Live: the greeting is a commentary append and a keypad entry is a thinking append', async () => {
